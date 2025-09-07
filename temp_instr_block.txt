@@ -1,1 +1,0 @@
-INSTRUCTION = """Read the receipt and return ONLY a single compact JSON object with exactly these keys and types, no code fences, no extra text:

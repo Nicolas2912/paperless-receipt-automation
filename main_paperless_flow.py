@@ -3,6 +3,7 @@ import sys
 import argparse
 from typing import Optional, Dict, Any, List
 import re
+import requests as _rq
 
 # Local components
 try:
@@ -60,7 +61,6 @@ try:
         ensure_correspondent_id,
         ensure_tag_ids,
         ensure_document_type_id,
-        get_next_archive_serial_number,
         _api_patch_document,
     )
 except Exception as e:
@@ -68,7 +68,6 @@ except Exception as e:
     ensure_correspondent_id = None  # type: ignore
     ensure_tag_ids = None  # type: ignore
     ensure_document_type_id = None  # type: ignore
-    get_next_archive_serial_number = None  # type: ignore
     _api_patch_document = None  # type: ignore
     print(f"[WARN] Could not import upload_paperless helpers: {e}", flush=True)
 
@@ -274,18 +273,10 @@ def build_upload_fields(
             tag_ids = ensure_tag_ids(base_url, token, [tag_name]) if ensure_tag_ids else []
             debug(f"Mapped tag '{tag_name}' -> ids={tag_ids}")
 
-    # ASN determination
-    final_asn = None
-    try:
-        if get_next_archive_serial_number:
-            final_asn = get_next_archive_serial_number(base_url, token)
-    except Exception as e:
-        debug(f"WARN: Failed to determine next ASN, defaulting to 1: {e}")
-        final_asn = 1
-    final_asn = final_asn or 1
-    title = md.title(final_asn)
+    # Title without ASN
+    title = md.title()
     created = md.ausstellungsdatum
-    debug(f"Final title: {title}")
+    debug(f"Final initial title: {title}")
 
     return {
         "title": title,
@@ -293,7 +284,6 @@ def build_upload_fields(
         "correspondent_id": correspondent_id,
         "document_type_id": document_type_id,
         "tag_ids": tag_ids,
-        "asn": final_asn,
     }
 
 
@@ -307,11 +297,12 @@ def upload_with_asn(
     insecure: bool = False,
 ) -> Dict[str, Any]:
     debug("Uploading PDF to Paperless …")
+    base_title = fields.get("title") or ""
     result = upload_document(
         file_path=pdf_path,
         base_url=base_url,
         token=token,
-        title=fields.get("title"),
+        title=base_title,
         created=fields.get("created"),
         correspondent_id=fields.get("correspondent_id"),
         tag_ids=fields.get("tag_ids"),
@@ -319,7 +310,7 @@ def upload_with_asn(
         timeout=timeout,
         verify_tls=not insecure,
     )
-    # Try to patch ASN if needed
+    # Try to resolve doc id (handle direct, task numeric id, and task uuid)
     doc_id: Optional[int] = None
     rj = result.get("json") if isinstance(result, dict) else None
     if isinstance(rj, dict):
@@ -334,27 +325,157 @@ def upload_with_asn(
                     doc_id = cand["id"]
         except Exception:
             pass
-    asn = fields.get("asn")
-    if doc_id and isinstance(asn, int) and asn > 0 and _api_patch_document is not None:
-        debug(f"Patching document id={doc_id} with ASN={asn}")
-        patched = _api_patch_document(base_url, token, doc_id, {"archive_serial_number": asn})
-        if not patched:
-            debug("WARN: ASN patch failed; retrying once with next ASN")
-            try:
-                retry_asn = get_next_archive_serial_number(base_url, token)
-            except Exception:
-                retry_asn = None
-            if isinstance(retry_asn, int) and retry_asn > 0 and retry_asn != asn:
-                patched_retry = _api_patch_document(base_url, token, doc_id, {"archive_serial_number": retry_asn})
-                if patched_retry:
-                    debug(f"Retry succeeded with ASN={retry_asn}")
-                else:
-                    debug("WARN: Retry failed; document remains without official ASN.")
-            else:
-                debug("No suitable retry ASN; skipping.")
-    else:
+        # Task polling fallback
         if not doc_id:
-            debug("WARN: Could not determine document ID from upload response; skip ASN patch.")
+            t_id_int = None
+            t_id_uuid = None
+            try:
+                if isinstance(rj.get("task"), dict):
+                    if isinstance(rj["task"].get("id"), int):
+                        t_id_int = rj["task"]["id"]
+                    if isinstance(rj["task"].get("task_id"), str):
+                        t_id_uuid = rj["task"]["task_id"]
+                if isinstance(rj.get("task_id"), int):
+                    t_id_int = rj["task_id"]
+                elif isinstance(rj.get("task_id"), str):
+                    t_id_uuid = rj["task_id"]
+                elif (isinstance(rj.get("status"), str) and isinstance(rj.get("id"), int)
+                      and any(k in rj for k in ("state", "status", "result", "url"))):
+                    t_id_int = rj["id"]
+            except Exception:
+                t_id_int = None
+                t_id_uuid = None
+
+            import time as _t
+            import requests as _rq
+
+            if t_id_int is not None:
+                task_url = f"{base_url.rstrip('/')}/api/tasks/{t_id_int}/"
+                debug(f"Polling numeric task {t_id_int} for document id …")
+                for attempt in range(1, 41):
+                    try:
+                        tr = _rq.get(task_url, headers={"Authorization": f"Token {token}", "Accept": "application/json"}, timeout=15)
+                        tr.raise_for_status()
+                        tj = tr.json()
+                    except Exception as e:
+                        debug(f"WARN: Task poll failed on attempt {attempt}: {e}")
+                        _t.sleep(0.5)
+                        continue
+                    cand_id = None
+                    try:
+                        if isinstance(tj, dict):
+                            if isinstance(tj.get("result"), dict):
+                                res = tj["result"]
+                                if isinstance(res.get("document"), dict) and isinstance(res["document"].get("id"), int):
+                                    cand_id = res["document"]["id"]
+                                elif isinstance(res.get("document_id"), int):
+                                    cand_id = res["document_id"]
+                                elif isinstance(res.get("id"), int):
+                                    cand_id = res["id"]
+                            if cand_id is None and isinstance(tj.get("url"), str):
+                                m = _re.search(r"/api/documents/(\d+)/", tj["url"])  # noqa: E501
+                                if m:
+                                    cand_id = int(m.group(1))
+                            if cand_id is None and isinstance(tj.get("document"), dict) and isinstance(tj["document"].get("id"), int):
+                                cand_id = tj["document"]["id"]
+                    except Exception:
+                        cand_id = None
+                    if isinstance(cand_id, int):
+                        doc_id = cand_id
+                        debug(f"Resolved document id from numeric task: {doc_id}")
+                        break
+                    _t.sleep(0.5)
+
+            if doc_id is None and t_id_uuid is not None:
+                list_url = f"{base_url.rstrip('/')}/api/tasks/?task_id={t_id_uuid}&page_size=1"
+                debug(f"Polling uuid task {t_id_uuid} for document id …")
+                for attempt in range(1, 41):
+                    try:
+                        tr = _rq.get(list_url, headers={"Authorization": f"Token {token}", "Accept": "application/json"}, timeout=15)
+                        tr.raise_for_status()
+                        data = tr.json()
+                        results = data.get("results") if isinstance(data, dict) else None
+                        tj = results[0] if results else None
+                    except Exception as e:
+                        debug(f"WARN: UUID task poll failed on attempt {attempt}: {e}")
+                        _t.sleep(0.5)
+                        continue
+                    cand_id = None
+                    try:
+                        if isinstance(tj, dict):
+                            if isinstance(tj.get("result"), dict):
+                                res = tj["result"]
+                                if isinstance(res.get("document"), dict) and isinstance(res["document"].get("id"), int):
+                                    cand_id = res["document"]["id"]
+                                elif isinstance(res.get("document_id"), int):
+                                    cand_id = res["document_id"]
+                                elif isinstance(res.get("id"), int):
+                                    cand_id = res["id"]
+                            if cand_id is None and isinstance(tj.get("url"), str):
+                                m = _re.search(r"/api/documents/(\d+)/", tj["url"])  # noqa: E501
+                                if m:
+                                    cand_id = int(m.group(1))
+                            if cand_id is None and isinstance(tj.get("document"), dict) and isinstance(tj["document"].get("id"), int):
+                                cand_id = tj["document"]["id"]
+                    except Exception:
+                        cand_id = None
+                    if isinstance(cand_id, int):
+                        doc_id = cand_id
+                        debug(f"Resolved document id from uuid task: {doc_id}")
+                        break
+                    _t.sleep(0.5)
+
+        # Fallback: if still none, try to match by title
+        if not doc_id and isinstance(base_title, str) and base_title:
+            try:
+                list_url = f"{base_url.rstrip('/')}/api/documents/?title__iexact={_rq.utils.quote(base_title)}&ordering=-id&page_size=1"
+                tr = _rq.get(list_url, headers={"Authorization": f"Token {token}", "Accept": "application/json"}, timeout=20)
+                tr.raise_for_status()
+                dj = tr.json()
+                results = dj.get("results") if isinstance(dj, dict) else None
+                if results and isinstance(results[0], dict) and isinstance(results[0].get("id"), int):
+                    doc_id = results[0]["id"]
+                    debug(f"Resolved document id by title search: {doc_id}")
+            except Exception as e:
+                debug(f"WARN: Fallback title search failed: {e}")
+    # Helper: GET document
+    def _get_doc(did: int) -> Optional[Dict[str, Any]]:
+        try:
+            u = f"{base_url.rstrip('/')}/api/documents/{did}/"
+            rr = _rq.get(u, headers={"Authorization": f"Token {token}", "Accept": "application/json"}, timeout=20)
+            rr.raise_for_status()
+            return rr.json()
+        except Exception as e:
+            debug(f"WARN: GET document {did} failed: {e}")
+            return None
+
+    # Enforce exact tags from mapping (avoid duplicate/default tags from server rules)
+    try:
+        desired_tag_ids = fields.get("tag_ids") or []
+        if isinstance(desired_tag_ids, list) and desired_tag_ids and isinstance(doc_id, int):
+            # Deduplicate while preserving order
+            seen = set()
+            dedup = []
+            for t in desired_tag_ids:
+                if isinstance(t, int) and t not in seen:
+                    seen.add(t)
+                    dedup.append(t)
+            if dedup:
+                debug(f"Patching document {doc_id} to enforce tags={dedup}")
+                try:
+                    _api_patch_document(base_url, token, doc_id, {"tags": dedup})  # type: ignore[arg-type]
+                    debug("Tags patched successfully to exact set from tag_map.")
+                except Exception as e:
+                    debug(f"WARN: Failed to patch tags on document {doc_id}: {e}")
+        else:
+            if not desired_tag_ids:
+                debug("No mapped tags to enforce; skipping tag patch step.")
+            if not isinstance(doc_id, int):
+                debug("Document ID unresolved; cannot patch tags.")
+    except Exception as e:
+        debug(f"WARN: Exception during tag enforcement: {e}")
+
+    # Return the upload result as-is.
     return result
 
 
@@ -429,7 +550,7 @@ def process_one_image(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="End-to-end: watch scans, OCR overlay, extract metadata, upload to Paperless with ASN")
+    p = argparse.ArgumentParser(description="End-to-end: watch scans, OCR overlay, extract metadata, upload to Paperless")
     p.add_argument("--mode", choices=["watch", "single"], default="watch", help="Run continuously watching for scans or process a single source image")
     p.add_argument("--source", help="When --mode=single, path to a single image to process")
     p.add_argument("--watch-dir", help="Optional watch directory; else read from scan-image-path.txt")

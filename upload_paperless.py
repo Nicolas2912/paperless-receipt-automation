@@ -130,6 +130,52 @@ def _api_patch_document(base_url: str, token: str, doc_id: int, payload: Dict[st
         return None
 
 
+def _api_find_task_by_uuid(base_url: str, token: str, task_uuid: str) -> Optional[Dict[str, Any]]:
+    base = base_url.rstrip("/")
+    url = f"{base}/api/tasks/?task_id={requests.utils.quote(task_uuid)}&page_size=1"
+    try:
+        r = requests.get(url, headers=_auth_headers(token), timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        results = data.get("results") if isinstance(data, dict) else None
+        if results and isinstance(results, list) and isinstance(results[0], dict):
+            return results[0]
+    except Exception as e:
+        debug(f"WARN: Failed to find task by UUID: {e}")
+    return None
+
+
+def _api_find_document_by_title(base_url: str, token: str, title: str) -> Optional[int]:
+    base = base_url.rstrip("/")
+    url = f"{base}/api/documents/?title__iexact={requests.utils.quote(title)}&ordering=-id&page_size=1"
+    try:
+        r = requests.get(url, headers=_auth_headers(token), timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        results = data.get("results") if isinstance(data, dict) else None
+        if results and isinstance(results, list) and isinstance(results[0], dict):
+            did = results[0].get("id")
+            if isinstance(did, int):
+                return did
+    except Exception as e:
+        debug(f"WARN: Could not search document by title: {e}")
+    return None
+
+
+def _api_get_document(base_url: str, token: str, doc_id: int) -> Optional[Dict[str, Any]]:
+    url = f"{base_url.rstrip('/')}/api/documents/{doc_id}/"
+    try:
+        r = requests.get(url, headers=_auth_headers(token), timeout=20)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        debug(f"WARN: Failed to GET document {doc_id}: {e}")
+        return None
+
+
+# ASN/AS handling removed: no title munging required.
+
+
 def _api_get_first_by_name(base_url: str, token: str, resource: str, name: str) -> Optional[Dict[str, Any]]:
     # Try iexact first, then fallback to icontains
     base = base_url.rstrip("/")
@@ -192,60 +238,7 @@ def ensure_document_type_id(base_url: str, token: str, name: str) -> Optional[in
     return created.get("id") if created else None
 
 
-ASN_PATTERN = re.compile(r"AS:\s*(\d+)")
-
-
-def get_next_archive_serial_number(base_url: str, token: str, *, max_pages: int = 5, page_size: int = 100) -> int:
-    """Return the next Archive Serial Number (ASN).
-
-    Prefer the Paperless `archive_serial_number` field if present, otherwise
-    fall back to scanning titles for the pattern "AS: <int>". Iterates up to
-    `max_pages` pages to find the current maximum and returns +1.
-    """
-    base = base_url.rstrip("/")
-    url = f"{base}/api/documents/?ordering=-id&page_size={page_size}"
-    max_found = 0
-    pages = 0
-    debug("Determined next ASN: scanning API for current maximum …")
-    while url and pages < max_pages:
-        try:
-            r = requests.get(url, headers=_auth_headers(token), timeout=30)
-            r.raise_for_status()
-            data = r.json()
-        except Exception as e:
-            debug(f"WARN: Could not list documents to determine ASN: {e}")
-            break
-        results = data.get("results") if isinstance(data, dict) else None
-        if not results:
-            break
-        for doc in results:
-            if not isinstance(doc, dict):
-                continue
-            # 1) Prefer explicit API field
-            as_field = doc.get("archive_serial_number")
-            try:
-                if isinstance(as_field, int) and as_field > 0:
-                    if as_field > max_found:
-                        max_found = as_field
-                    continue
-            except Exception:
-                pass
-            # 2) Fallback to title scan (backwards compatibility)
-            title = doc.get("title")
-            if isinstance(title, str):
-                m = ASN_PATTERN.search(title)
-                if m:
-                    try:
-                        num = int(m.group(1))
-                        if num > max_found:
-                            max_found = num
-                    except Exception:
-                        pass
-        url = data.get("next") if isinstance(data, dict) else None
-        pages += 1
-    next_asn = max_found + 1 if max_found > 0 else 1
-    debug(f"Determined next ASN candidate: {next_asn} (max found: {max_found})")
-    return next_asn
+"""Serial number logic removed by request."""
 
 # Removed task polling by request; rely on Paperless async processing without client-side polling.
 
@@ -259,7 +252,6 @@ def upload_document(
     correspondent_id: Optional[int] = None,
     tag_ids: Optional[List[int]] = None,
     document_type_id: Optional[int] = None,
-    archive_serial_number: Optional[int] = None,
     timeout: int = 60,
     verify_tls: bool = True,
 ) -> Dict:
@@ -291,9 +283,7 @@ def upload_document(
     if tag_ids:
         for tid in tag_ids:
             data_list.append(("tags", str(tid)))
-    # Avoid sending ASN in POST to prevent collisions under concurrent uploads.
-    if archive_serial_number is not None:
-        debug("Note: archive_serial_number provided but will NOT be included in POST. Will PATCH after upload.")
+    # Extra serial numbering is not supported.
 
     with open(file_path, "rb") as f:
         files = {"document": (os.path.basename(file_path), f, mime)}
@@ -415,7 +405,6 @@ def main():
     # Load or prepare metadata
     md = None
     md_json: Optional[Dict[str, Any]] = None
-    final_asn_used: Optional[int] = None
 
     # Prefer explicit JSON metadata when provided
     if args.metadata:
@@ -485,20 +474,9 @@ def main():
                 if tag_name:
                     tag_ids = ensure_tag_ids(args.base_url, token, [tag_name])
                     debug(f"Mapped tag '{tag_name}' -> ids={tag_ids} (from metadata JSON)")
-            # ASN
-            md_asn = md_json.get("asn") if isinstance(md_json, dict) else None
-            if isinstance(md_asn, int) and md_asn > 0:
-                final_asn_used = md_asn
-                debug(f"Using ASN from metadata JSON: {final_asn_used}")
-            if not isinstance(final_asn_used, int):
-                try:
-                    final_asn_used = get_next_archive_serial_number(args.base_url, token)
-                except Exception as e2:
-                    debug(f"WARN: Failed to determine next ASN, defaulting to 1: {e2}")
-                    final_asn_used = 1
             # Title: build from md if not explicitly provided by CLI
             if md is not None and not title:
-                title = md.title(final_asn_used)
+                title = md.title()
                 debug(f"Constructed title from metadata JSON: {title}")
         except Exception as e:
             debug(f"WARN: Failed applying metadata JSON: {e}")
@@ -522,33 +500,12 @@ def main():
             tag_ids = ensure_tag_ids(args.base_url, token, [tag_name])
             debug(f"Mapped tag '{tag_name}' -> ids={tag_ids}")
 
-        # Title + created with sequential ASN
+        # Title + created (no ASN)
         created = created or md.ausstellungsdatum
-        try:
-            final_asn_used = get_next_archive_serial_number(args.base_url, token)
-        except Exception as e:
-            debug(f"WARN: Failed to determine next ASN, defaulting to 1: {e}")
-            final_asn_used = 1
+        title = title or md.title()
+        debug(f"Final title: {title}")
 
-        # Use md.title(asn) to keep consistency with extractor and required format
-        title = title or md.title(final_asn_used)
-        debug(f"Final title (from ExtractedMetadata): {title}")
-
-    # If title already contains an ASN, remember it for consistency
-    if title:
-        _m = ASN_PATTERN.search(title)
-        if _m:
-            try:
-                title_asn_val = int(_m.group(1))
-                if final_asn_used is None:
-                    final_asn_used = title_asn_val
-                    debug(f"Detected ASN from provided title: {final_asn_used}")
-                elif final_asn_used != title_asn_val:
-                    debug(f"WARN: ASN mismatch between computed ({final_asn_used}) and title ({title_asn_val}). Will apply {final_asn_used} to Paperless.")
-            except Exception:
-                pass
-
-    # Do not append provisional ASN here; we will patch the title after upload with the actually assigned ASN
+    # No ASN-related title handling required.
 
     try:
         result = upload_document(
@@ -560,7 +517,6 @@ def main():
             correspondent_id=correspondent_id,
             tag_ids=tag_ids,
             document_type_id=document_type_id,
-            archive_serial_number=final_asn_used,
             timeout=args.timeout,
             verify_tls=not args.insecure,
         )
@@ -568,68 +524,80 @@ def main():
         debug(f"FATAL: {e}")
         sys.exit(1)
 
+    # After upload, enforce only the mapped tag (avoid duplicate default tags)
+    try:
+        desired_tag_ids = tag_ids or []
+        doc_id: Optional[int] = None
+        rj = result.get("json") if isinstance(result, dict) else None
+        if isinstance(rj, dict):
+            try:
+                if isinstance(rj.get("id"), int):
+                    doc_id = rj["id"]
+                elif isinstance(rj.get("document"), dict) and isinstance(rj["document"].get("id"), int):
+                    doc_id = rj["document"]["id"]
+                elif isinstance(rj.get("results"), list) and rj["results"]:
+                    cand = rj["results"][0]
+                    if isinstance(cand, dict) and isinstance(cand.get("id"), int):
+                        doc_id = cand["id"]
+            except Exception:
+                doc_id = None
+            # If task uuid present, try to fetch it (best-effort, no long polling here)
+            if not doc_id:
+                try:
+                    task_uuid = None
+                    if isinstance(rj.get("task"), dict) and isinstance(rj["task"].get("task_id"), str):
+                        task_uuid = rj["task"]["task_id"]
+                    elif isinstance(rj.get("task_id"), str):
+                        task_uuid = rj["task_id"]
+                    if task_uuid:
+                        t = _api_find_task_by_uuid(args.base_url, token, task_uuid)
+                        if isinstance(t, dict):
+                            # Try to extract document id from task payload
+                            res = t.get("result") if isinstance(t.get("result"), dict) else None
+                            if isinstance(res, dict):
+                                if isinstance(res.get("document"), dict) and isinstance(res["document"].get("id"), int):
+                                    doc_id = res["document"]["id"]
+                                elif isinstance(res.get("document_id"), int):
+                                    doc_id = res["document_id"]
+                except Exception:
+                    pass
+        # Fallback: try by exact title if still unknown
+        if not doc_id and isinstance(title, str) and title:
+            did = _api_find_document_by_title(args.base_url, token, title)
+            if isinstance(did, int):
+                doc_id = did
+                debug(f"Resolved document id by title: {doc_id}")
+
+        # Enforce exact tags if we have both doc id and mapped tags
+        if isinstance(doc_id, int) and isinstance(desired_tag_ids, list) and desired_tag_ids:
+            # Deduplicate order-preserving
+            seen = set()
+            dedup: List[int] = []
+            for t in desired_tag_ids:
+                if isinstance(t, int) and t not in seen:
+                    seen.add(t)
+                    dedup.append(t)
+            debug(f"Patching tags on document {doc_id} to {dedup}")
+            try:
+                _api_patch_document(args.base_url, token, doc_id, {"tags": dedup})
+                debug("Tags patched successfully to exact set from tag_map.")
+            except Exception as e:
+                debug(f"WARN: Failed to patch tags on document {doc_id}: {e}")
+        else:
+            if not desired_tag_ids:
+                debug("No mapped tags to enforce; skipping tag patch.")
+            if not isinstance(doc_id, int):
+                debug("Could not resolve document id to patch tags; skipping.")
+    except Exception as e:
+        debug(f"WARN: Exception during post-upload tag enforcement: {e}")
+
     debug("Upload finished. Final response payload below:")
     try:
         print(json.dumps(result, indent=2, ensure_ascii=False))
     except Exception:
         print(result)
 
-    # Attempt to extract created document ID and set archive_serial_number via PATCH
-    doc_id: Optional[int] = None
-    rj = result.get("json") if isinstance(result, dict) else None
-    if isinstance(rj, dict):
-        try:
-            if isinstance(rj.get("id"), int):
-                doc_id = rj["id"]
-            elif isinstance(rj.get("document"), dict) and isinstance(rj["document"].get("id"), int):
-                doc_id = rj["document"]["id"]
-            elif isinstance(rj.get("results"), list) and rj["results"]:
-                first = rj["results"][0]
-                if isinstance(first, dict) and isinstance(first.get("id"), int):
-                    doc_id = first["id"]
-        except Exception:
-            pass
-
-    if doc_id:
-        assigned_asn: Optional[int] = None
-        max_attempts = 7
-        for attempt in range(1, max_attempts + 1):
-            try:
-                fresh_asn = get_next_archive_serial_number(args.base_url, token)
-            except Exception as e:
-                debug(f"WARN: Could not compute next ASN on attempt {attempt}: {e}")
-                break
-            debug(f"Attempt {attempt}/{max_attempts}: Patching doc {doc_id} with ASN={fresh_asn}")
-            patched = _api_patch_document(args.base_url, token, doc_id, {"archive_serial_number": fresh_asn})
-            if patched and isinstance(patched, dict) and isinstance(patched.get("archive_serial_number"), int):
-                assigned_asn = patched.get("archive_serial_number")
-                debug(f"ASN set on document {doc_id}: {assigned_asn}")
-                break
-            else:
-                # Exponential backoff to let previous uploads finalize their ASN
-                sleep_s = min(0.25 * (2 ** (attempt - 1)), 3.0)
-                debug(f"WARN: ASN patch failed; possibly due to collision. Sleeping {sleep_s:.2f}s before retry…")
-                time.sleep(sleep_s)
-        if not assigned_asn:
-            debug("WARN: Could not set archive_serial_number after retries. Document remains without official ASN.")
-        else:
-            # Always align the title to reflect the assigned ASN (append if not present)
-            try:
-                if title and isinstance(assigned_asn, int):
-                    current_title = title
-                    m = ASN_PATTERN.search(current_title)
-                    if m:
-                        new_title = ASN_PATTERN.sub(f"AS: {assigned_asn}", current_title)
-                    else:
-                        new_title = f"{current_title} - AS: {assigned_asn}"
-                    if new_title != current_title:
-                        debug(f"Updating title to reflect assigned ASN: {new_title}")
-                        _ = _api_patch_document(args.base_url, token, doc_id, {"title": new_title})
-            except Exception as e:
-                debug(f"WARN: Failed to synchronize title with assigned ASN: {e}")
-    else:
-        if not doc_id:
-            debug("WARN: Could not determine document ID from upload response; cannot set archive_serial_number.")
+    # ASN/AS post-upload logic removed.
 
 
 if __name__ == "__main__":

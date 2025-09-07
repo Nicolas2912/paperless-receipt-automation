@@ -5,10 +5,10 @@ Goals (from initial comments):
 - Use qwen2.5vl-receipt to extract:
   - Korrespondent (store name on the receipt)
   - Ausstellungsdatum (date of purchase)
-  - Titel (title) — we will build a consistent title in Python
+  - Titel (title) – we will build a consistent title in Python
   - Tags — chosen via a mapping file (not by the model)
   - Dokumenttyp — always "Kassenbon"
-  - The Archive Serial Number (ASN) is NOT extracted here; it is assigned upstream as a sequential integer during upload.
+  - The Archive Serial Number (ASN) is not used in this project.
 
 Strictness:
 - The LLM must return ONLY compact JSON with a fixed schema so we can parse reliably.
@@ -35,95 +35,6 @@ from dataclasses import dataclass, asdict
 from typing import Optional, Dict, Any
 import requests
 import re
-
-ASN_PATTERN = re.compile(r"AS:\s*(\d+)")
-
-def _auth_headers(token: str) -> Dict[str, str]:
-    return {"Authorization": f"Token {token}", "Accept": "application/json"}
-
-
-def _load_token_from_env_or_dotenv(dotenv_path: str) -> Optional[str]:
-    tok = os.environ.get("PAPERLESS_TOKEN")
-    if tok:
-        debug("Using PAPERLESS_TOKEN from environment.")
-        return tok.strip()
-    if os.path.isfile(dotenv_path):
-        debug(f"Attempting to read PAPERLESS_TOKEN from .env: {dotenv_path}")
-        try:
-            with open(dotenv_path, "r", encoding="utf-8") as f:
-                for raw in f:
-                    line = raw.strip()
-                    if not line or line.startswith("#") or line.startswith(";"):
-                        continue
-                    if "=" not in line:
-                        continue
-                    k, v = line.split("=", 1)
-                    if k.strip() != "PAPERLESS_TOKEN":
-                        continue
-                    v = v.strip()
-                    if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
-                        v = v[1:-1]
-                    v = v.strip()
-                    if v:
-                        debug("Loaded PAPERLESS_TOKEN from .env file.")
-                        return v
-        except Exception as e:
-            debug(f"Failed reading .env file: {e}")
-    debug("No PAPERLESS_TOKEN in env/.env; ASN will be skipped unless --token provided.")
-    return None
-
-
-def get_next_archive_serial_number(base_url: str, token: str, *, max_pages: int = 5, page_size: int = 100) -> int:
-    """Return the next Archive Serial Number (ASN).
-
-    Prefer the Paperless `archive_serial_number` field if present, otherwise
-    fall back to scanning titles for the pattern "AS: <int>". Iterates up to
-    `max_pages` pages to find the current maximum and returns +1.
-    """
-    base = base_url.rstrip("/")
-    url = f"{base}/api/documents/?ordering=-id&page_size={page_size}"
-    max_found = 0
-    pages = 0
-    debug("Querying Paperless for current maximum ASN …")
-    while url and pages < max_pages:
-        try:
-            r = requests.get(url, headers=_auth_headers(token), timeout=30)
-            r.raise_for_status()
-            data = r.json()
-        except Exception as e:
-            debug(f"WARN: Could not list documents to determine ASN: {e}")
-            break
-        results = data.get("results") if isinstance(data, dict) else None
-        if not results:
-            break
-        for doc in results:
-            if not isinstance(doc, dict):
-                continue
-            # 1) Prefer explicit API field
-            as_field = doc.get("archive_serial_number")
-            try:
-                if isinstance(as_field, int) and as_field > 0:
-                    if as_field > max_found:
-                        max_found = as_field
-                    continue
-            except Exception:
-                pass
-            # 2) Fallback to title scan (backwards compatibility)
-            title = doc.get("title")
-            if isinstance(title, str):
-                m = ASN_PATTERN.search(title)
-                if m:
-                    try:
-                        num = int(m.group(1))
-                        if num > max_found:
-                            max_found = num
-                    except Exception:
-                        pass
-        url = data.get("next") if isinstance(data, dict) else None
-        pages += 1
-    next_asn = max_found + 1 if max_found > 0 else 1
-    debug(f"Determined next ASN candidate: {next_asn} (max found: {max_found})")
-    return next_asn
 
 
 def debug(msg: str) -> None:
@@ -367,12 +278,11 @@ class ExtractedMetadata:
     betrag_currency: str
     dokumenttyp: str = "Kassenbon"
 
-    def title(self, asn: Optional[int] = None) -> str:
+    def title(self) -> str:
         """Return title in format:
-        "<dateinisoformat> - <korrespondent> - <betrag_value_de> - AS: <asn>"
+        "<dateinisoformat> - <korrespondent> - <betrag_value_de>"
 
         - betrag_value_de is German formatted (dot thousands, comma decimals)
-        - ASN is appended only when provided
         """
         k = self.korrespondent
         date = self.ausstellungsdatum
@@ -387,7 +297,7 @@ class ExtractedMetadata:
                 return str(x)
         amt_de = _fmt_de(self.betrag_value)
         base = f"{date} - {k} - {amt_de}"
-        return f"{base} - AS: {asn}" if isinstance(asn, int) else base
+        return base
 
 
 
@@ -423,7 +333,7 @@ def extract_from_source(
             md.korrespondent, md.ausstellungsdatum, md.betrag_value, md.betrag_currency
         )
     )
-    debug(f"Generated base title (no ASN): {md.title()}")
+    debug(f"Generated base title: {md.title()}")
     return md
 
 
@@ -432,9 +342,7 @@ def main():
     ap.add_argument("--source", required=True, help="Path to receipt image or PDF (first page will be used by the model)")
     ap.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL, help="Ollama base URL (default from OLLAMA_URL or http://localhost:11434)")
     ap.add_argument("--model", default=DEFAULT_MODEL, help="Ollama model name (default qwen2.5vl-receipt:latest)")
-    ap.add_argument("--base-url", default=os.environ.get("PAPERLESS_BASE_URL", "http://localhost:8000"), help="Paperless base URL for ASN lookup")
-    ap.add_argument("--token", default=None, help="Paperless API token (overrides env/.env)")
-    ap.add_argument("--with-asn", action="store_true", help="Deprecated: ASN is now added automatically when token is available")
+    # Note: ASN is not used; no Paperless API lookup is needed here.
     args = ap.parse_args()
 
     debug("Starting extract_metadata.py")
@@ -443,26 +351,8 @@ def main():
         debug("FATAL: Extraction failed")
         sys.exit(1)
 
-    # Resolve token and always attempt ASN enrichment when possible
-    asn: Optional[int] = None
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    dotenv_path = os.path.join(script_dir, ".env")
-    token = args.token or _load_token_from_env_or_dotenv(dotenv_path)
-    if token:
-        try:
-            asn = get_next_archive_serial_number(args.base_url, token)
-        except Exception as e:
-            debug(f"WARN: Failed to determine next ASN: {e}")
-            asn = None
-    else:
-        debug("No Paperless token available; skipping ASN enrichment.")
-
-    # Include ASN in output JSON and title when available
-    out = asdict(md) | {"title": md.title(asn)}
-    if isinstance(asn, int):
-        out["asn"] = asn
-    else:
-        out["asn"] = None
+    # Build output without ASN
+    out = asdict(md) | {"title": md.title()}
     print(json.dumps(out, ensure_ascii=False))
 
 
