@@ -1,0 +1,517 @@
+import os
+import sys
+import argparse
+from typing import Optional, Dict, Any, List
+import re
+
+# Local components
+try:
+    from scan_event_listener import ScanEventListener, debug_print as scan_debug
+except Exception as e:
+    ScanEventListener = None  # type: ignore
+    def scan_debug(msg: str) -> None:
+        print(f"[scan-listener] {msg}", flush=True)
+    print(f"[WARN] Could not import ScanEventListener: {e}", flush=True)
+
+try:
+    from ollama_transcriber import transcribe_image_via_ollama
+except Exception as e:
+    transcribe_image_via_ollama = None  # type: ignore
+    print(f"[WARN] Could not import transcriber: {e}", flush=True)
+
+try:
+    from preconsume_overlay_pdf import create_pdf_with_invisible_text, ensure_dir, unique_path
+except Exception as e:
+    create_pdf_with_invisible_text = None  # type: ignore
+    def ensure_dir(p: str) -> str:
+        ap = os.path.abspath(p)
+        os.makedirs(ap, exist_ok=True)
+        return ap
+    def unique_path(base_path: str) -> str:
+        if not os.path.exists(base_path):
+            return base_path
+        stem, ext = os.path.splitext(base_path)
+        i = 1
+        while True:
+            cand = f"{stem} ({i}){ext}"
+            if not os.path.exists(cand):
+                return cand
+            i += 1
+    print(f"[WARN] Could not import preconsume utilities: {e}", flush=True)
+
+try:
+    from extract_metadata import extract_from_source, ExtractedMetadata, _normalize_korrespondent
+except Exception as e:
+    extract_from_source = None  # type: ignore
+    ExtractedMetadata = None  # type: ignore
+    def _normalize_korrespondent(x: str) -> str:  # type: ignore
+        return (x or "").strip()
+    print(f"[WARN] Could not import extract_metadata: {e}", flush=True)
+
+try:
+    from rename_documents import rename_with_metadata
+except Exception as e:
+    rename_with_metadata = None  # type: ignore
+    print(f"[WARN] Could not import rename_documents: {e}", flush=True)
+
+try:
+    from upload_paperless import (
+        upload_document,
+        ensure_correspondent_id,
+        ensure_tag_ids,
+        ensure_document_type_id,
+        get_next_archive_serial_number,
+        _api_patch_document,
+    )
+except Exception as e:
+    upload_document = None  # type: ignore
+    ensure_correspondent_id = None  # type: ignore
+    ensure_tag_ids = None  # type: ignore
+    ensure_document_type_id = None  # type: ignore
+    get_next_archive_serial_number = None  # type: ignore
+    _api_patch_document = None  # type: ignore
+    print(f"[WARN] Could not import upload_paperless helpers: {e}", flush=True)
+
+
+def debug(msg: str) -> None:
+    print(f"[main-paperless-flow] {msg}", flush=True)
+
+
+def load_token(dotenv_dir: str) -> Optional[str]:
+    # Mirror upload_paperless _load_token_from_env_or_dotenv behavior
+    tok = os.environ.get("PAPERLESS_TOKEN")
+    if tok:
+        debug("Using PAPERLESS_TOKEN from environment.")
+        return tok.strip()
+    dotenv_path = os.path.join(dotenv_dir, ".env")
+    if not os.path.isfile(dotenv_path):
+        debug(f"No .env found at: {dotenv_path}")
+        return None
+    debug(f"Attempting to read PAPERLESS_TOKEN from .env: {dotenv_path}")
+    try:
+        with open(dotenv_path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or line.startswith(";"):
+                    continue
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip() != "PAPERLESS_TOKEN":
+                    continue
+                v = v.strip()
+                if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                    v = v[1:-1]
+                v = v.strip()
+                if v:
+                    debug("Loaded PAPERLESS_TOKEN from .env file.")
+                    return v
+    except Exception as e:
+        debug(f"Failed reading .env file: {e}")
+    return None
+
+
+def load_tag_map(script_dir: str) -> Dict[str, str]:
+    tag_map_path = os.path.join(script_dir, "tag_map.json")
+    if not os.path.isfile(tag_map_path):
+        debug("No tag_map.json found; proceeding without tag mapping.")
+        return {}
+    try:
+        import json
+        with open(tag_map_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            debug(f"Loaded tag_map.json with {len(data)} entries")
+            return data
+    except Exception as e:
+        debug(f"WARN: Failed to read tag_map.json: {e}")
+    return {}
+
+
+def transcribe_to_text(image_path: str, *, ollama_url: str, ollama_model: str) -> Optional[str]:
+    if transcribe_image_via_ollama is None:
+        debug("FATAL: transcribe_image_via_ollama not available.")
+        return None
+    debug(f"Calling Ollama for transcription: url={ollama_url}, model={ollama_model}")
+    return transcribe_image_via_ollama(image_path=image_path, model=ollama_model, ollama_url=ollama_url)
+
+
+def create_overlay_pdf(image_path: str, text: str, out_dir: str) -> Optional[str]:
+    if create_pdf_with_invisible_text is None:
+        debug("FATAL: create_pdf_with_invisible_text not available.")
+        return None
+    ensure_dir(out_dir)
+    base = os.path.splitext(os.path.basename(image_path))[0]
+    out_pdf = unique_path(os.path.join(out_dir, f"{base}.pdf"))
+    debug(f"Creating overlay PDF: {out_pdf}")
+    try:
+        create_pdf_with_invisible_text(image_path, text, out_pdf)
+        return out_pdf
+    except Exception as e:
+        debug(f"ERROR creating overlay PDF: {e}")
+        return None
+
+
+def extract_md_for_upload(source_pdf: str, *, ollama_url: str, ollama_model: str) -> Optional[ExtractedMetadata]:
+    if extract_from_source is None:
+        debug("FATAL: extract_from_source not available.")
+        return None
+    debug(f"Extracting structured metadata from: {source_pdf}")
+    return extract_from_source(source_pdf, ollama_url=ollama_url, model=ollama_model)
+
+
+def _norm_date(text: str) -> Optional[str]:
+    m = re.search(r"(\d{1,2})[./](\d{1,2})[./](\d{2,4})", text)
+    if m:
+        d, mth, y = m.groups()
+        if len(y) == 2:
+            y = ("20" + y) if int(y) < 70 else ("19" + y)
+        return f"{int(y):04d}-{int(mth):02d}-{int(d):02d}"
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", text)
+    if m:
+        return m.group(0)
+    return None
+
+
+def _norm_amount(text: str) -> Optional[str]:
+    # Prefer amounts labeled as total
+    total_block = re.findall(r"(?is)(summe|gesamt|total)[^\d]*(\d+[.,]\d{2})", text)
+    cand = total_block[-1][1] if total_block else None
+    if not cand:
+        # Fallback: pick the largest decimal-looking number
+        nums = [n for n in re.findall(r"\d+[.,]\d{2}", text)]
+        cand = max(nums, key=len) if nums else None
+    if not cand:
+        return None
+    s = cand.strip().replace(" ", "")
+    has_dot = "." in s
+    has_comma = "," in s
+    if has_dot and has_comma:
+        if re.search(r",\d{1,2}$", s):
+            s = s.replace(".", "").replace(",", ".")
+        elif re.search(r"\.\d{1,2}$", s):
+            s = s.replace(",", "")
+        else:
+            s = s.replace(".", "").replace(",", ".")
+    elif has_comma:
+        if re.search(r",\d{1,2}$", s):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif has_dot:
+        if not re.search(r"\.\d{1,2}$", s):
+            s = s.replace(".", "")
+    try:
+        from decimal import Decimal
+        return f"{Decimal(s):.2f}"
+    except Exception:
+        try:
+            return f"{float(s):.2f}"
+        except Exception:
+            return None
+
+
+def _detect_currency(text: str) -> str:
+    if "€" in text or re.search(r"\bEUR\b", text, re.I):
+        return "EUR"
+    if "$" in text or re.search(r"\bUSD\b", text, re.I):
+        return "USD"
+    return "EUR"
+
+
+def _guess_merchant(text: str) -> str:
+    # Use first non-empty line that doesn't look like generic words
+    lines = [ln.strip() for ln in re.split(r"[\r\n]+", text) if ln.strip()]
+    blacklist = {"kassenbon", "rechnung", "beleg", "bon"}
+    for ln in lines[:10]:
+        low = re.sub(r"[^a-z0-9äöüß ]", "", ln.lower())
+        if all(w not in low for w in blacklist) and len(ln) >= 2:
+            return ln[:60]
+    return "Unbekannt"
+
+
+def extract_metadata_from_text(text: str) -> Optional[ExtractedMetadata]:
+    if ExtractedMetadata is None:
+        return None
+    date_iso = _norm_date(text) or "1970-01-01"
+    amount = _norm_amount(text) or "0.00"
+    currency = _detect_currency(text)
+    merchant = _normalize_korrespondent(_guess_merchant(text))
+    try:
+        return ExtractedMetadata(
+            korrespondent=merchant,
+            ausstellungsdatum=date_iso,
+            betrag_value=amount,
+            betrag_currency=currency,
+        )
+    except Exception:
+        return None
+
+
+def build_upload_fields(
+    md: ExtractedMetadata,
+    *,
+    base_url: str,
+    token: str,
+    script_dir: str,
+) -> Dict[str, Any]:
+    # Map correspondent and document type
+    correspondent_id = ensure_correspondent_id(base_url, token, md.korrespondent) if ensure_correspondent_id else None
+    document_type_id = ensure_document_type_id(base_url, token, md.dokumenttyp) if ensure_document_type_id else None
+    if correspondent_id:
+        debug(f"Resolved correspondent '{md.korrespondent}' -> id={correspondent_id}")
+    else:
+        debug(f"WARN: Could not resolve/create correspondent for '{md.korrespondent}'")
+    if document_type_id:
+        debug(f"Resolved document type '{md.dokumenttyp}' -> id={document_type_id}")
+
+    # Tags via tag_map
+    tag_map = load_tag_map(script_dir)
+    tag_ids: List[int] = []
+    if tag_map and isinstance(tag_map, dict):
+        tag_name = tag_map.get(md.korrespondent.lower())
+        if tag_name:
+            tag_ids = ensure_tag_ids(base_url, token, [tag_name]) if ensure_tag_ids else []
+            debug(f"Mapped tag '{tag_name}' -> ids={tag_ids}")
+
+    # ASN determination
+    final_asn = None
+    try:
+        if get_next_archive_serial_number:
+            final_asn = get_next_archive_serial_number(base_url, token)
+    except Exception as e:
+        debug(f"WARN: Failed to determine next ASN, defaulting to 1: {e}")
+        final_asn = 1
+    final_asn = final_asn or 1
+    title = md.title(final_asn)
+    created = md.ausstellungsdatum
+    debug(f"Final title: {title}")
+
+    return {
+        "title": title,
+        "created": created,
+        "correspondent_id": correspondent_id,
+        "document_type_id": document_type_id,
+        "tag_ids": tag_ids,
+        "asn": final_asn,
+    }
+
+
+def upload_with_asn(
+    pdf_path: str,
+    base_url: str,
+    token: str,
+    fields: Dict[str, Any],
+    *,
+    timeout: int = 60,
+    insecure: bool = False,
+) -> Dict[str, Any]:
+    debug("Uploading PDF to Paperless …")
+    result = upload_document(
+        file_path=pdf_path,
+        base_url=base_url,
+        token=token,
+        title=fields.get("title"),
+        created=fields.get("created"),
+        correspondent_id=fields.get("correspondent_id"),
+        tag_ids=fields.get("tag_ids"),
+        document_type_id=fields.get("document_type_id"),
+        timeout=timeout,
+        verify_tls=not insecure,
+    )
+    # Try to patch ASN if needed
+    doc_id: Optional[int] = None
+    rj = result.get("json") if isinstance(result, dict) else None
+    if isinstance(rj, dict):
+        try:
+            if isinstance(rj.get("id"), int):
+                doc_id = rj["id"]
+            elif isinstance(rj.get("document"), dict) and isinstance(rj["document"].get("id"), int):
+                doc_id = rj["document"]["id"]
+            elif isinstance(rj.get("results"), list) and rj["results"]:
+                cand = rj["results"][0]
+                if isinstance(cand, dict) and isinstance(cand.get("id"), int):
+                    doc_id = cand["id"]
+        except Exception:
+            pass
+    asn = fields.get("asn")
+    if doc_id and isinstance(asn, int) and asn > 0 and _api_patch_document is not None:
+        debug(f"Patching document id={doc_id} with ASN={asn}")
+        patched = _api_patch_document(base_url, token, doc_id, {"archive_serial_number": asn})
+        if not patched:
+            debug("WARN: ASN patch failed; retrying once with next ASN")
+            try:
+                retry_asn = get_next_archive_serial_number(base_url, token)
+            except Exception:
+                retry_asn = None
+            if isinstance(retry_asn, int) and retry_asn > 0 and retry_asn != asn:
+                patched_retry = _api_patch_document(base_url, token, doc_id, {"archive_serial_number": retry_asn})
+                if patched_retry:
+                    debug(f"Retry succeeded with ASN={retry_asn}")
+                else:
+                    debug("WARN: Retry failed; document remains without official ASN.")
+            else:
+                debug("No suitable retry ASN; skipping.")
+    else:
+        if not doc_id:
+            debug("WARN: Could not determine document ID from upload response; skip ASN patch.")
+    return result
+
+
+def process_one_image(
+    image_path: str,
+    *,
+    ollama_url: str,
+    ollama_model: str,
+    base_url: str,
+    token: str,
+    out_dir: str,
+    insecure: bool = False,
+    timeout: int = 60,
+    listener=None,
+) -> Optional[str]:
+    debug(f"Processing image: {image_path}")
+    text = transcribe_to_text(image_path, ollama_url=ollama_url, ollama_model=ollama_model)
+    if not text:
+        debug("ERROR: Transcription failed or returned empty text. Skipping.")
+        return None
+    pdf_path = create_overlay_pdf(image_path, text, out_dir)
+    if not pdf_path:
+        debug("ERROR: PDF overlay creation failed. Skipping.")
+        return None
+    # Prefer extracting structured fields from the already transcribed text to reduce VLM work
+    md = extract_metadata_from_text(text)
+    if md is None:
+        md = extract_md_for_upload(pdf_path, ollama_url=ollama_url, ollama_model=ollama_model)
+    if md is None:
+        debug("ERROR: Metadata extraction failed. Skipping upload.")
+        return None
+    # Rename image and PDF right before upload using extracted metadata
+    if rename_with_metadata is None:
+        debug("FATAL: rename_documents module not available.")
+        return None
+    try:
+        old_base = os.path.basename(image_path)
+        new_image_path, new_pdf_path = rename_with_metadata(
+            image_path,
+            pdf_path,
+            date_iso=getattr(md, "ausstellungsdatum", "1970-01-01"),
+            korrespondent=getattr(md, "korrespondent", "Unbekannt"),
+        )
+        # Update locals for upload path
+        image_path = new_image_path
+        pdf_path = new_pdf_path
+        debug(f"Renamed for upload -> image: {image_path}")
+        debug(f"Renamed for upload -> pdf:   {pdf_path}")
+        # Prevent the watcher from re-detecting the rename as a new file
+        if listener is not None and hasattr(listener, "baseline"):
+            try:
+                new_base = os.path.basename(new_image_path)
+                listener.baseline.add(new_base)  # type: ignore[attr-defined]
+                # Keep last_new_image_path in sync for any consumer
+                if hasattr(listener, "last_new_image_path"):
+                    listener.last_new_image_path = new_image_path  # type: ignore[attr-defined]
+                debug(f"Updated watcher baseline with renamed file: {new_base}")
+            except Exception as e:
+                debug(f"WARN: Could not update watcher baseline after rename: {e}")
+    except Exception as e:
+        debug(f"ERROR: Failed to rename files before upload: {e}")
+        return None
+    fields = build_upload_fields(md, base_url=base_url, token=token, script_dir=os.path.dirname(os.path.abspath(__file__)))
+    result = upload_with_asn(pdf_path, base_url, token, fields, insecure=insecure, timeout=timeout)
+    try:
+        import json
+        debug("Upload result:")
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    except Exception:
+        print(result)
+    return pdf_path
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="End-to-end: watch scans, OCR overlay, extract metadata, upload to Paperless with ASN")
+    p.add_argument("--mode", choices=["watch", "single"], default="watch", help="Run continuously watching for scans or process a single source image")
+    p.add_argument("--source", help="When --mode=single, path to a single image to process")
+    p.add_argument("--watch-dir", help="Optional watch directory; else read from scan-image-path.txt")
+    p.add_argument("--output-dir", default="generated_pdfs", help="Directory to write generated PDFs")
+    p.add_argument("--ollama-url", default=os.environ.get("OLLAMA_URL", "http://localhost:11434"), help="Ollama base URL (no /api/chat suffix needed)")
+    p.add_argument("--ollama-model", default=os.environ.get("OLLAMA_MODEL", "qwen2.5vl-receipt:latest"), help="Ollama model name")
+    p.add_argument("--base-url", default=os.environ.get("PAPERLESS_BASE_URL", "http://localhost:8000"), help="Paperless base URL")
+    p.add_argument("--token", help="Paperless API token (overrides env/.env)")
+    p.add_argument("--insecure", action="store_true", help="Disable TLS verification when talking to Paperless")
+    p.add_argument("--timeout", type=int, default=60, help="HTTP timeout seconds for upload")
+    return p
+
+
+def main() -> None:
+    args = build_arg_parser().parse_args()
+
+    debug("Starting main_paperless_flow.py")
+    debug(f"Working dir: {os.getcwd()}")
+    debug(f"Conda env: {os.environ.get('CONDA_DEFAULT_ENV')}")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    debug(f"Script dir: {script_dir}")
+
+    token = args.token or load_token(script_dir)
+    if not token:
+        debug("FATAL: PAPERLESS_TOKEN missing. Provide --token or set in env/.env.")
+        sys.exit(1)
+
+    out_dir = ensure_dir(args.output_dir)
+    debug(f"Output dir: {out_dir}")
+
+    if args.mode == "single":
+        src = args.source
+        if not src or not os.path.isfile(src):
+            debug("FATAL: Provide a valid --source for single mode.")
+            sys.exit(2)
+        process_one_image(
+            src,
+            ollama_url=args.ollama_url,
+            ollama_model=args.ollama_model,
+            base_url=args.base_url,
+            token=token,
+            out_dir=out_dir,
+            insecure=args.insecure,
+            timeout=args.timeout,
+        )
+        return
+
+    # Watch mode
+    if ScanEventListener is None:
+        debug("FATAL: ScanEventListener not available; cannot run watch mode.")
+        sys.exit(2)
+
+    listener = ScanEventListener(
+        watch_dir=args.watch_dir,
+        print_on_detect=False,
+        poll_interval_sec=1.0,
+    )
+    scan_debug(f"Watch mode active. Watching: {listener.watch_dir}")
+    debug("Press Ctrl+C to stop watching.")
+    try:
+        while True:
+            new_paths = listener.scan_once()
+            if not new_paths:
+                import time as _t
+                _t.sleep(listener.poll_interval_sec)
+                continue
+            for image_path in new_paths:
+                debug(f"Detected new image: {image_path}")
+                process_one_image(
+                    image_path,
+                    ollama_url=args.ollama_url,
+                    ollama_model=args.ollama_model,
+                    base_url=args.base_url,
+                    token=token,
+                    out_dir=out_dir,
+                    insecure=args.insecure,
+                    timeout=args.timeout,
+                    listener=listener,
+                )
+    except KeyboardInterrupt:
+        debug("Interrupted by user. Exiting watch mode.")
+
+
+if __name__ == "__main__":
+    main()
