@@ -7,7 +7,11 @@ import requests as _rq
 
 # Local components
 try:
-    from scan_event_listener import ScanEventListener, debug_print as scan_debug
+    from scan_event_listener import (
+        ScanEventListener,
+        debug_print as scan_debug,
+        read_watch_dir_from_file as _read_watch_dir_from_file,
+    )
 except Exception as e:
     ScanEventListener = None  # type: ignore
     def scan_debug(msg: str) -> None:
@@ -70,6 +74,24 @@ except Exception as e:
     ensure_document_type_id = None  # type: ignore
     _api_patch_document = None  # type: ignore
     print(f"[WARN] Could not import upload_paperless helpers: {e}", flush=True)
+
+try:
+    from processed_index import (
+        ensure_db as _ensure_db,
+        compute_file_hash as _compute_file_hash,
+        is_processed as _is_processed,
+        mark_processed as _mark_processed,
+        initial_sync_with_paperless as _initial_sync_with_paperless,
+        _update_doc_id_for_hash as _update_doc_id_for_hash,
+        list_jpeg_basenames_in_dir as _list_jpegs,
+    )
+except Exception as e:
+    _ensure_db = None  # type: ignore
+    _compute_file_hash = None  # type: ignore
+    _is_processed = None  # type: ignore
+    _mark_processed = None  # type: ignore
+    _initial_sync_with_paperless = None  # type: ignore
+    print(f"[WARN] Could not import processed_index: {e}", flush=True)
 
 
 def debug(msg: str) -> None:
@@ -373,7 +395,7 @@ def upload_with_asn(
                                 elif isinstance(res.get("id"), int):
                                     cand_id = res["id"]
                             if cand_id is None and isinstance(tj.get("url"), str):
-                                m = _re.search(r"/api/documents/(\d+)/", tj["url"])  # noqa: E501
+                                m = re.search(r"/api/documents/(\d+)/", tj["url"])  # noqa: E501
                                 if m:
                                     cand_id = int(m.group(1))
                             if cand_id is None and isinstance(tj.get("document"), dict) and isinstance(tj["document"].get("id"), int):
@@ -412,7 +434,7 @@ def upload_with_asn(
                                 elif isinstance(res.get("id"), int):
                                     cand_id = res["id"]
                             if cand_id is None and isinstance(tj.get("url"), str):
-                                m = _re.search(r"/api/documents/(\d+)/", tj["url"])  # noqa: E501
+                                m = re.search(r"/api/documents/(\d+)/", tj["url"])  # noqa: E501
                                 if m:
                                     cand_id = int(m.group(1))
                             if cand_id is None and isinstance(tj.get("document"), dict) and isinstance(tj["document"].get("id"), int):
@@ -475,7 +497,12 @@ def upload_with_asn(
     except Exception as e:
         debug(f"WARN: Exception during tag enforcement: {e}")
 
-    # Return the upload result as-is.
+    # Attach resolved document id to the result for downstream consumers.
+    try:
+        if isinstance(result, dict):
+            result["doc_id"] = doc_id
+    except Exception:
+        pass
     return result
 
 
@@ -490,8 +517,19 @@ def process_one_image(
     insecure: bool = False,
     timeout: int = 60,
     listener=None,
+    db_path: Optional[str] = None,
+    precomputed_hash: Optional[str] = None,
 ) -> Optional[str]:
     debug(f"Processing image: {image_path}")
+    # Compute file hash early for DB tracking
+    file_hash: Optional[str] = None
+    try:
+        if precomputed_hash is not None:
+            file_hash = precomputed_hash
+        elif _compute_file_hash is not None:
+            file_hash = _compute_file_hash(image_path)
+    except Exception as e:
+        debug(f"WARN: Could not compute file hash: {e}")
     text = transcribe_to_text(image_path, ollama_url=ollama_url, ollama_model=ollama_model)
     if not text:
         debug("ERROR: Transcription failed or returned empty text. Skipping.")
@@ -546,6 +584,102 @@ def process_one_image(
         print(json.dumps(result, indent=2, ensure_ascii=False))
     except Exception:
         print(result)
+    # Try to extract a document ID from the response for DB linking
+    doc_id: Optional[int] = None
+    try:
+        if isinstance(result, dict) and isinstance(result.get("doc_id"), int):
+            doc_id = result.get("doc_id")
+        else:
+            rj = result.get("json") if isinstance(result, dict) else None
+            if isinstance(rj, dict):
+                if isinstance(rj.get("id"), int):
+                    doc_id = rj["id"]
+                elif isinstance(rj.get("document"), dict) and isinstance(rj["document"].get("id"), int):
+                    doc_id = rj["document"]["id"]
+                elif isinstance(rj.get("results"), list) and rj["results"] and isinstance(rj["results"][0], dict):
+                    cand = rj["results"][0]
+                    if isinstance(cand.get("id"), int):
+                        doc_id = cand["id"]
+    except Exception:
+        doc_id = None
+
+    # Final best-effort: resolve by original_filename (the uploaded PDF basename)
+    if doc_id is None:
+        try:
+            base = os.path.basename(pdf_path)
+            list_url = f"{base_url.rstrip('/')}/api/documents/?original_filename__iexact={_rq.utils.quote(base)}&ordering=-id&page_size=1"
+            tr = _rq.get(list_url, headers={"Authorization": f"Token {token}", "Accept": "application/json"}, timeout=20)
+            tr.raise_for_status()
+            dj = tr.json()
+            results = dj.get("results") if isinstance(dj, dict) else None
+            if results and isinstance(results[0], dict) and isinstance(results[0].get("id"), int):
+                doc_id = results[0]["id"]
+                debug(f"Resolved document id by original_filename: {doc_id}")
+        except Exception as e:
+            debug(f"WARN: original_filename lookup failed: {e}")
+
+    # Record in processed DB
+    try:
+        if db_path and _mark_processed is not None:
+            base_title = fields.get("title") if isinstance(fields, dict) else None
+            original_filename = os.path.basename(pdf_path)
+            if file_hash is None and _compute_file_hash is not None:
+                try:
+                    file_hash = _compute_file_hash(image_path)
+                except Exception:
+                    file_hash = None
+            if file_hash:
+                _mark_processed(
+                    db_path,
+                    file_hash=file_hash,
+                    file_path=image_path,
+                    original_filename=original_filename,
+                    paperless_doc_id=doc_id,
+                    title=base_title,
+                )
+                debug(f"Recorded to DB: hash={file_hash[:8]}..., doc_id={doc_id}")
+            else:
+                debug("WARN: Skipping DB record; file hash unavailable.")
+    except Exception as e:
+        debug(f"WARN: Failed to record processed item in DB: {e}")
+
+    # If doc_id is still None, poll Paperless by original_filename to backfill
+    if db_path and file_hash and (doc_id is None):
+        try:
+            import time as _t
+            pdf_base = os.path.basename(pdf_path)
+            list_url = f"{base_url.rstrip('/')}/api/documents/?original_filename__iexact={_rq.utils.quote(pdf_base)}&ordering=-id&page_size=1"
+            debug(f"Will poll up to 45s for doc id (0.5s interval, initial 3s delay) for original_filename='{pdf_base}'…")
+            start = _t.monotonic()
+            _t.sleep(3.0)  # initial delay to let Paperless register the document
+            deadline = start + 45.0
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    tr = _rq.get(list_url, headers={"Authorization": f"Token {token}", "Accept": "application/json"}, timeout=15)
+                    tr.raise_for_status()
+                    dj = tr.json()
+                    results = dj.get("results") if isinstance(dj, dict) else None
+                    if results and isinstance(results[0], dict) and isinstance(results[0].get("id"), int):
+                        doc_id = results[0]["id"]
+                        debug(f"Backfilled paperless doc id: {doc_id} (attempt {attempt})")
+                        if _update_doc_id_for_hash is not None:
+                            try:
+                                _update_doc_id_for_hash(db_path, file_hash, doc_id)
+                                debug("Updated DB row with resolved doc id.")
+                            except Exception as e:
+                                debug(f"WARN: Failed to update DB with doc id: {e}")
+                        break
+                except Exception as e:
+                    debug(f"WARN: Poll attempt {attempt} failed: {e}")
+                if _t.monotonic() >= deadline:
+                    break
+                _t.sleep(0.5)
+            if doc_id is None:
+                debug("ERROR: No doc_id resolved within 45s; DB field remains NULL for now.")
+        except Exception as e:
+            debug(f"WARN: Error while polling for doc id: {e}")
     return pdf_path
 
 
@@ -581,11 +715,30 @@ def main() -> None:
     out_dir = ensure_dir(args.output_dir)
     debug(f"Output dir: {out_dir}")
 
+    # Initialize processed DB path
+    db_path: Optional[str] = None
+    if _ensure_db is not None:
+        try:
+            db_path = _ensure_db(script_dir)
+        except Exception as e:
+            debug(f"WARN: Failed to initialize local DB: {e}")
+
     if args.mode == "single":
         src = args.source
         if not src or not os.path.isfile(src):
             debug("FATAL: Provide a valid --source for single mode.")
             sys.exit(2)
+        # Pre-check against DB to avoid duplicate work
+        pre_h: Optional[str] = None
+        try:
+            if db_path and _compute_file_hash and _is_processed:
+                pre_h = _compute_file_hash(src)
+                if _is_processed(db_path, pre_h):
+                    debug("Already processed (per DB). Skipping single file.")
+                    return
+        except Exception as e:
+            debug(f"WARN: Pre-hash check failed; proceeding: {e}")
+
         process_one_image(
             src,
             ollama_url=args.ollama_url,
@@ -595,6 +748,8 @@ def main() -> None:
             out_dir=out_dir,
             insecure=args.insecure,
             timeout=args.timeout,
+            db_path=db_path,
+            precomputed_hash=pre_h,
         )
         return
 
@@ -603,8 +758,72 @@ def main() -> None:
         debug("FATAL: ScanEventListener not available; cannot run watch mode.")
         sys.exit(2)
 
+    # Resolve watch dir similarly to the listener for initial sync
+    try:
+        if args.watch_dir:
+            resolved_watch_dir = os.path.abspath(os.path.expanduser(os.path.expandvars(args.watch_dir)))
+        else:
+            if callable(_read_watch_dir_from_file):
+                resolved_watch_dir = _read_watch_dir_from_file()
+            else:
+                debug("FATAL: Cannot resolve watch dir; helper unavailable.")
+                sys.exit(2)
+    except Exception as e:
+        debug(f"FATAL: Failed to resolve watch dir: {e}")
+        sys.exit(2)
+
+    # Bring DB in sync with Paperless for all files currently in the watch dir
+    if db_path and _initial_sync_with_paperless is not None:
+        try:
+            _initial_sync_with_paperless(
+                db_path=db_path,
+                watch_dir=resolved_watch_dir,
+                base_url=args.base_url,
+                token=token,
+            )
+        except Exception as e:
+            debug(f"WARN: Initial sync failed: {e}")
+
+    # Backlog processing: process any JPEGs in watch dir that are not yet recorded in DB
+    try:
+        if db_path and _compute_file_hash and _is_processed and callable(_list_jpegs):
+            names = _list_jpegs(resolved_watch_dir)
+            debug(f"Backlog sweep: found {len(names)} JPEG(s) present at startup")
+            processed_now = 0
+            skipped_existing = 0
+            for name in names:
+                path = os.path.abspath(os.path.join(resolved_watch_dir, name))
+                try:
+                    h = _compute_file_hash(path)
+                except Exception as e:
+                    debug(f"WARN: Failed to hash backlog file '{name}': {e}")
+                    continue
+                if _is_processed(db_path, h):
+                    skipped_existing += 1
+                    continue
+                debug(f"Backlog: processing '{name}' (not in DB)")
+                process_one_image(
+                    path,
+                    ollama_url=args.ollama_url,
+                    ollama_model=args.ollama_model,
+                    base_url=args.base_url,
+                    token=token,
+                    out_dir=out_dir,
+                    insecure=args.insecure,
+                    timeout=args.timeout,
+                    listener=None,  # will create listener after sweep
+                    db_path=db_path,
+                    precomputed_hash=h,
+                )
+                processed_now += 1
+            debug(f"Backlog sweep completed: processed={processed_now}, already_in_db={skipped_existing}")
+        else:
+            debug("Backlog sweep skipped (DB or helpers unavailable)")
+    except Exception as e:
+        debug(f"WARN: Backlog sweep failed: {e}")
+
     listener = ScanEventListener(
-        watch_dir=args.watch_dir,
+        watch_dir=resolved_watch_dir,
         print_on_detect=False,
         poll_interval_sec=1.0,
     )
@@ -619,6 +838,17 @@ def main() -> None:
                 continue
             for image_path in new_paths:
                 debug(f"Detected new image: {image_path}")
+                # Skip if DB already contains this by hash
+                pre_h2: Optional[str] = None
+                try:
+                    if db_path and _compute_file_hash and _is_processed:
+                        pre_h2 = _compute_file_hash(image_path)
+                        if _is_processed(db_path, pre_h2):
+                            debug("Already processed (per DB). Skipping this file.")
+                            continue
+                except Exception as e:
+                    debug(f"WARN: Hash pre-check failed: {e}")
+
                 process_one_image(
                     image_path,
                     ollama_url=args.ollama_url,
@@ -629,6 +859,8 @@ def main() -> None:
                     insecure=args.insecure,
                     timeout=args.timeout,
                     listener=listener,
+                    db_path=db_path,
+                    precomputed_hash=pre_h2,
                 )
     except KeyboardInterrupt:
         debug("Interrupted by user. Exiting watch mode.")
