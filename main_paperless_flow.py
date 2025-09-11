@@ -327,7 +327,7 @@ def upload_with_asn(
     timeout: int = 60,
     insecure: bool = False,
 ) -> Dict[str, Any]:
-    debug("Uploading PDF to Paperless â€¦")
+    debug("Uploading PDF to Paperless")
     base_title = fields.get("title") or ""
     result = upload_document(
         file_path=pdf_path,
@@ -672,7 +672,7 @@ def process_one_image(
             import time as _t
             pdf_base = os.path.basename(pdf_path)
             list_url = f"{base_url.rstrip('/')}/api/documents/?original_filename__iexact={_rq.utils.quote(pdf_base)}&ordering=-id&page_size=1"
-            debug(f"Will poll up to 45s for doc id (0.5s interval, initial 3s delay) for original_filename='{pdf_base}'â€¦")
+            debug(f"Will poll up to 45s for doc id (0.5s interval, initial 3s delay) for original_filename='{pdf_base}'")
             start = _t.monotonic()
             _t.sleep(3.0)  # initial delay to let Paperless register the document
             deadline = start + 45.0

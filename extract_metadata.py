@@ -5,9 +5,9 @@ Goals (from initial comments):
 - Use qwen2.5vl-receipt to extract:
   - Korrespondent (store name on the receipt)
   - Ausstellungsdatum (date of purchase)
-  - Titel (title) â€“ we will build a consistent title in Python
-  - Tags â€” chosen via a mapping file (not by the model)
-  - Dokumenttyp â€” always "Kassenbon"
+  - Titel (title - we will build a consistent title in Python
+  - Tags - chosen via a mapping file (not by the model)
+  - Dokumenttyp - always "Kassenbon"
   - The Archive Serial Number (ASN) is not used in this project.
 
 Strictness:
@@ -155,50 +155,6 @@ def _ollama_chat_vision(image_path: str, model: str, ollama_url: str, timeout: i
     except Exception as e:
         debug(f"ERROR parsing LLM JSON: {e}; content preview: {content[:200]}")
         return None
-
-
-def _normalize_korrespondent(name: str) -> str:
-    # Basic cleanup: strip spaces, remove URLs, keep reasonable characters
-    n = (name or "").strip()
-    # If value looks like a JSON key-value (e.g., "merchant": "dm ..."), extract only the value
-    m = re.match(r'^\s*"?(merchant|korrespondent)"?\s*:\s*"?(.+?)"?\s*,?\s*$', n, flags=re.IGNORECASE)
-    if m:
-        n = m.group(2).strip()
-    n = re.sub(r"https?://\S+", "", n)
-    n = re.sub(r"\s+", " ", n)
-
-    # Remove common legal/entity suffixes and generic words that frequently appear on receipts
-    n = re.sub(r"\b(GmbH|GmbH & Co\. KG|Co\. KG|KG|AG|UG|SE|e\.K\.|e\.K|oHG|S\.p\.A\.|S\.p\.A|& Co\.|& Co)\b", "", n, flags=re.IGNORECASE)
-    n = re.sub(r"\b(Warenhaus|Markt|Zentrale|Filiale)\b", "", n, flags=re.IGNORECASE)
-    n = re.sub(r"\s+", " ", n).strip(" ,-")
-
-    # Strip diacritics to stabilize brand keys (e.g., famÃ­lia -> familia)
-    try:
-        import unicodedata
-        n_ascii = unicodedata.normalize("NFKD", n).encode("ascii", "ignore").decode("ascii")
-        if n_ascii:
-            n = n_ascii
-    except Exception:
-        pass
-
-    # Heuristic normalization for known brand variants
-    low = n.lower()
-    # Normalize various forms like "dm drogerie markt", "dm-drogerie markt", "dmi-drogerie markt" to "DM"
-    # We look for the presence of "drogerie" and a dm/dmi token to be safe.
-    if ("drogerie" in low and (re.search(r"\bdm\b", low) or re.search(r"\bdmi\b", low))) or re.search(r"\bdm[-\s]?drogerie", low):
-        debug(f"Normalizing korrespondent '{name}' to 'DM'")
-        return "DM"
-
-    # Famila/familia variants -> 'Familia' (title case) per user preference
-    if re.search(r"\bfamila\b|\bfamilia\b", low):
-        debug(f"Normalizing korrespondent '{name}' to 'Familia'")
-        return "Familia"
-
-    # Netto Marken-Discount -> Netto
-    if "netto" in low:
-        return "Netto"
-
-    return n
 
 
 def _normalize_date_iso(value: str) -> Optional[str]:
