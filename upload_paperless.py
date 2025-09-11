@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import os
 import sys
 import json
@@ -16,12 +16,17 @@ except Exception as e:
     def _noop_debug_import(msg: str) -> None:
         print(f"[paperless-uploader] [WARN] extract_metadata not importable: {e}")
 
-# Try to reuse the same correspondent normalizer as extractor
+# Tag/merchant normalization utilities
 try:
-    from extract_metadata import _normalize_korrespondent  # type: ignore
+    from merchant_normalization import (
+        normalize_korrespondent as _normalize_korrespondent,  # type: ignore
+        resolve_tag_and_key as _resolve_tag_and_key,           # type: ignore
+    )
 except Exception:
     def _normalize_korrespondent(name: str) -> str:  # type: ignore
-        return (name or "").strip()
+        return (name or "").lower()
+    def _choose_tag(tag_map, name):  # type: ignore
+        return "NO TAG FOUND"
 
 
 def debug(msg: str) -> None:
@@ -346,7 +351,7 @@ def upload_document(
 
 
 def main():
-    p = argparse.ArgumentParser(description="Upload a document to Paperless‑NGX via API.")
+    p = argparse.ArgumentParser(description="Upload a document to Paperlessâ€‘NGX via API.")
     p.add_argument("--file", required=True, help="Path to the PDF (or image) to upload")
     p.add_argument("--base-url", default="http://localhost:8000",
                     help="Paperless base URL, e.g., http://localhost:8000")
@@ -494,11 +499,14 @@ def main():
         if document_type_id:
             debug(f"Using document type '{md.dokumenttyp}' (id={document_type_id})")
 
-        # Map tags from korrespondent via tag_map (case-insensitive)
-        tag_name = tag_map.get(md.korrespondent.lower()) if isinstance(tag_map, dict) else None
+        # Choose tag using exact/substring/fuzzy on normalized keys
+        tag_name, matched_key = _resolve_tag_and_key(tag_map if isinstance(tag_map, dict) else {}, md.korrespondent)
+        if matched_key:
+            debug(f"Canonical merchant from tag key: '{matched_key}' (was '{md.korrespondent}')")
+            md.korrespondent = matched_key
         if tag_name:
             tag_ids = ensure_tag_ids(args.base_url, token, [tag_name])
-            debug(f"Mapped tag '{tag_name}' -> ids={tag_ids}")
+            debug(f"Selected tag '{tag_name}' -> ids={tag_ids}")
 
         # Title + created (no ASN)
         created = created or md.ausstellungsdatum
@@ -602,3 +610,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

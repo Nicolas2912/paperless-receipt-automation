@@ -42,25 +42,59 @@ def _next_shared_id(
     kor: str,
     image_ext: str,
 ) -> int:
-    """Return the next available integer id s.t. neither
-    `<image_dir>/<date>_<kor>_<id>.<image_ext>` nor `<pdf_dir>/<date>_<kor>_<id>.pdf` exists.
-    Additionally, guard against collisions with other common JPEG variants
-    (e.g., .jpg, .jpeg) to keep the sequence stable across variants.
-    Starts at 1.
+    """Return the next id scoped to (date_iso, kor).
+
+    - Scans both `image_dir` and `pdf_dir` for files named
+      `<date>_<kor>_<id>.<ext>` and returns `max(id)+1` (or 1 if none).
+    - Only counts files whose base matches the SAME date and SAME korrespondent,
+      so different dates start again at 1, as requested.
+    - Considers common JPEG variants and `.pdf`.
     """
-    sid = 1
-    # Build the set of image extensions to check for collisions
+    # Build the set of image extensions to check when scanning
     exts_to_check: Iterable[str] = set([image_ext.lower()]) | JPEG_EXTS
-    while True:
-        base = f"{date_iso}_{kor}_{sid}"
-        # If any variant exists, treat id as taken
-        variant_exists = any(
-            os.path.exists(os.path.join(image_dir, base + ext)) for ext in exts_to_check
-        )
-        pdf_path = os.path.join(pdf_dir, base + ".pdf")
-        if not variant_exists and not os.path.exists(pdf_path):
-            return sid
-        sid += 1
+
+    ids = set()
+    try:
+        # Scan image dir for matching JPEG basenames
+        for name in os.listdir(image_dir):
+            low = name.lower()
+            for ext in exts_to_check:
+                if not low.endswith(ext):
+                    continue
+                stem = name[: -len(ext)]
+                m = re.fullmatch(rf"{re.escape(date_iso)}_{re.escape(kor)}_(\d+)", stem, flags=re.IGNORECASE)
+                if m:
+                    try:
+                        ids.add(int(m.group(1)))
+                    except Exception:
+                        pass
+        # Scan pdf dir for matching PDF basenames
+        for name in os.listdir(pdf_dir):
+            if not name.lower().endswith('.pdf'):
+                continue
+            stem = name[:-4]
+            m = re.fullmatch(rf"{re.escape(date_iso)}_{re.escape(kor)}_(\d+)", stem, flags=re.IGNORECASE)
+            if m:
+                try:
+                    ids.add(int(m.group(1)))
+                except Exception:
+                    pass
+    except Exception:
+        # If scanning fails for any reason, fall back to probing incrementally
+        sid = 1
+        while True:
+            base = f"{date_iso}_{kor}_{sid}"
+            variant_exists = any(
+                os.path.exists(os.path.join(image_dir, base + ext)) for ext in exts_to_check
+            )
+            pdf_path = os.path.join(pdf_dir, base + ".pdf")
+            if not variant_exists and not os.path.exists(pdf_path):
+                return sid
+            sid += 1
+
+    if not ids:
+        return 1
+    return max(ids) + 1
 
 
 def rename_with_metadata(

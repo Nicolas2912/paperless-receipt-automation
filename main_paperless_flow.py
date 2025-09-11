@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sys
 import argparse
 from typing import Optional, Dict, Any, List
@@ -45,13 +45,20 @@ except Exception as e:
     print(f"[WARN] Could not import preconsume utilities: {e}", flush=True)
 
 try:
-    from extract_metadata import extract_from_source, ExtractedMetadata, _normalize_korrespondent
+    from extract_metadata import extract_from_source, ExtractedMetadata
 except Exception as e:
     extract_from_source = None  # type: ignore
     ExtractedMetadata = None  # type: ignore
-    def _normalize_korrespondent(x: str) -> str:  # type: ignore
-        return (x or "").strip()
     print(f"[WARN] Could not import extract_metadata: {e}", flush=True)
+
+try:
+    from merchant_normalization import normalize_korrespondent as _normalize_korrespondent, resolve_tag_and_key as _resolve_tag_and_key
+except Exception as e:
+    def _normalize_korrespondent(x: str) -> str:  # type: ignore
+        return (x or "").lower()
+    def _choose_tag(tag_map, name):  # type: ignore
+        return "NO TAG FOUND"
+    print(f"[WARN] Could not import merchant_normalization: {e}", flush=True)
 
 try:
     from rename_documents import rename_with_metadata
@@ -233,7 +240,7 @@ def _norm_amount(text: str) -> Optional[str]:
 
 
 def _detect_currency(text: str) -> str:
-    if "€" in text or re.search(r"\bEUR\b", text, re.I):
+    if "â‚¬" in text or re.search(r"\bEUR\b", text, re.I):
         return "EUR"
     if "$" in text or re.search(r"\bUSD\b", text, re.I):
         return "USD"
@@ -245,7 +252,7 @@ def _guess_merchant(text: str) -> str:
     lines = [ln.strip() for ln in re.split(r"[\r\n]+", text) if ln.strip()]
     blacklist = {"kassenbon", "rechnung", "beleg", "bon"}
     for ln in lines[:10]:
-        low = re.sub(r"[^a-z0-9äöüß ]", "", ln.lower())
+        low = re.sub(r"[^a-z0-9Ã¤Ã¶Ã¼ÃŸ ]", "", ln.lower())
         if all(w not in low for w in blacklist) and len(ln) >= 2:
             return ln[:60]
     return "Unbekannt"
@@ -276,7 +283,18 @@ def build_upload_fields(
     token: str,
     script_dir: str,
 ) -> Dict[str, Any]:
-    # Map correspondent and document type
+    # Load tag map and resolve canonical merchant + tag
+    tag_map = load_tag_map(script_dir)
+    tag_ids: List[int] = []
+    tag_name, matched_key = _resolve_tag_and_key(tag_map, md.korrespondent)
+    if matched_key:
+        debug(f"Canonical merchant from tag key: {matched_key!r} (was {md.korrespondent!r})")
+        md.korrespondent = matched_key
+    if tag_name:
+        tag_ids = ensure_tag_ids(base_url, token, [tag_name]) if ensure_tag_ids else []
+        debug(f"Selected tag '{tag_name}' -> ids={tag_ids}")
+
+    # Resolve correspondent and document type using possibly-updated merchant
     correspondent_id = ensure_correspondent_id(base_url, token, md.korrespondent) if ensure_correspondent_id else None
     document_type_id = ensure_document_type_id(base_url, token, md.dokumenttyp) if ensure_document_type_id else None
     if correspondent_id:
@@ -286,16 +304,7 @@ def build_upload_fields(
     if document_type_id:
         debug(f"Resolved document type '{md.dokumenttyp}' -> id={document_type_id}")
 
-    # Tags via tag_map
-    tag_map = load_tag_map(script_dir)
-    tag_ids: List[int] = []
-    if tag_map and isinstance(tag_map, dict):
-        tag_name = tag_map.get(md.korrespondent.lower())
-        if tag_name:
-            tag_ids = ensure_tag_ids(base_url, token, [tag_name]) if ensure_tag_ids else []
-            debug(f"Mapped tag '{tag_name}' -> ids={tag_ids}")
-
-    # Title without ASN
+    # Title without ASN (uses possibly-updated md.korrespondent)
     title = md.title()
     created = md.ausstellungsdatum
     debug(f"Final initial title: {title}")
@@ -318,7 +327,7 @@ def upload_with_asn(
     timeout: int = 60,
     insecure: bool = False,
 ) -> Dict[str, Any]:
-    debug("Uploading PDF to Paperless …")
+    debug("Uploading PDF to Paperless â€¦")
     base_title = fields.get("title") or ""
     result = upload_document(
         file_path=pdf_path,
@@ -373,7 +382,7 @@ def upload_with_asn(
 
             if t_id_int is not None:
                 task_url = f"{base_url.rstrip('/')}/api/tasks/{t_id_int}/"
-                debug(f"Polling numeric task {t_id_int} for document id …")
+                debug(f"Polling numeric task {t_id_int} for document id â€¦")
                 for attempt in range(1, 41):
                     try:
                         tr = _rq.get(task_url, headers={"Authorization": f"Token {token}", "Accept": "application/json"}, timeout=15)
@@ -410,7 +419,7 @@ def upload_with_asn(
 
             if doc_id is None and t_id_uuid is not None:
                 list_url = f"{base_url.rstrip('/')}/api/tasks/?task_id={t_id_uuid}&page_size=1"
-                debug(f"Polling uuid task {t_id_uuid} for document id …")
+                debug(f"Polling uuid task {t_id_uuid} for document id â€¦")
                 for attempt in range(1, 41):
                     try:
                         tr = _rq.get(list_url, headers={"Authorization": f"Token {token}", "Accept": "application/json"}, timeout=15)
@@ -546,6 +555,20 @@ def process_one_image(
         debug("ERROR: Metadata extraction failed. Skipping upload.")
         return None
     # Rename image and PDF right before upload using extracted metadata
+
+    # Resolve canonical merchant from tag_map before renaming, so filenames use the key
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        tag_map = load_tag_map(script_dir)
+        if callable(_resolve_tag_and_key):
+            tag_name, matched_key = _resolve_tag_and_key(tag_map, md.korrespondent)  # type: ignore
+            if matched_key:
+                debug(f"Using canonical merchant for filenames: {matched_key!r} (was {md.korrespondent!r})")
+                md.korrespondent = matched_key
+            else:
+                debug("No canonical merchant found for filenames; keeping normalized extraction.")
+    except Exception as e:
+        debug(f"WARN: Canonical merchant resolution before rename failed: {e}")
     if rename_with_metadata is None:
         debug("FATAL: rename_documents module not available.")
         return None
@@ -649,7 +672,7 @@ def process_one_image(
             import time as _t
             pdf_base = os.path.basename(pdf_path)
             list_url = f"{base_url.rstrip('/')}/api/documents/?original_filename__iexact={_rq.utils.quote(pdf_base)}&ordering=-id&page_size=1"
-            debug(f"Will poll up to 45s for doc id (0.5s interval, initial 3s delay) for original_filename='{pdf_base}'…")
+            debug(f"Will poll up to 45s for doc id (0.5s interval, initial 3s delay) for original_filename='{pdf_base}'â€¦")
             start = _t.monotonic()
             _t.sleep(3.0)  # initial delay to let Paperless register the document
             deadline = start + 45.0
@@ -868,3 +891,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+

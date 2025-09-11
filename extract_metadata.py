@@ -1,13 +1,13 @@
-"""
+﻿"""
 Extract structured metadata from a receipt using Ollama (qwen2.5vl-receipt).
 
 Goals (from initial comments):
 - Use qwen2.5vl-receipt to extract:
   - Korrespondent (store name on the receipt)
   - Ausstellungsdatum (date of purchase)
-  - Titel (title) – we will build a consistent title in Python
-  - Tags — chosen via a mapping file (not by the model)
-  - Dokumenttyp — always "Kassenbon"
+  - Titel (title) â€“ we will build a consistent title in Python
+  - Tags â€” chosen via a mapping file (not by the model)
+  - Dokumenttyp â€” always "Kassenbon"
   - The Archive Serial Number (ASN) is not used in this project.
 
 Strictness:
@@ -105,7 +105,7 @@ def _build_prompt() -> str:
         "- korrespondent: the store/brand as printed (short, no URLs, no legal text).\n"
         "- ausstellungsdatum: parse date (e.g., DD.MM.YYYY) and output ISO YYYY-MM-DD. If none, leave as \"1970-01-01\".\n"
         "- betrag_value: the grand total; dot decimal, exactly two decimals, no thousands separators.\n"
-        "- betrag_currency: 3-letter like EUR; if symbol € is shown, use EUR.\n"
+        "- betrag_currency: 3-letter like EUR; if symbol â‚¬ is shown, use EUR.\n"
         "- dokumenttyp: exactly Kassenbon.\n"
         "- Do NOT invent data. Do NOT include any file paths. Output ONLY the JSON object."
     )
@@ -172,7 +172,7 @@ def _normalize_korrespondent(name: str) -> str:
     n = re.sub(r"\b(Warenhaus|Markt|Zentrale|Filiale)\b", "", n, flags=re.IGNORECASE)
     n = re.sub(r"\s+", " ", n).strip(" ,-")
 
-    # Strip diacritics to stabilize brand keys (e.g., família -> familia)
+    # Strip diacritics to stabilize brand keys (e.g., famÃ­lia -> familia)
     try:
         import unicodedata
         n_ascii = unicodedata.normalize("NFKD", n).encode("ascii", "ignore").decode("ascii")
@@ -318,7 +318,8 @@ def extract_from_source(
     if obj is None:
         return None
 
-    kor = _normalize_korrespondent(obj.get("korrespondent", ""))
+    from merchant_normalization import normalize_korrespondent as _norm_k
+    kor = _norm_k(obj.get("korrespondent", ""))
     date_iso = _normalize_date_iso(str(obj.get("ausstellungsdatum", "").strip())) or "1970-01-01"
     amt = _normalize_amount(obj.get("betrag_value")) or "0.00"
     cur = (obj.get("betrag_currency") or "EUR").strip().upper()
@@ -358,3 +359,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
