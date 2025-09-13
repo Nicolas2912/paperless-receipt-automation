@@ -1,8 +1,15 @@
 from typing import Dict, List, Optional, Tuple
 import re
+import unicodedata
 
 
 def _only_letters_and_spaces(s: str) -> str:
+    """Keep only Unicode letters and spaces, preserving German umlauts.
+
+    - Operates on NFC-normalized text so characters like 'u' + combining
+      diaeresis become 'ü' and are retained as letters.
+    - Collapses any whitespace runs to a single ASCII space and strips ends.
+    """
     kept: List[str] = []
     for ch in (s or ""):
         if ch.isalpha() or ch.isspace():
@@ -17,7 +24,10 @@ def _remove_legal_tokens(s: str) -> str:
         return s
     tokens = [
         "gmbh co kg", "gmbh und co kg", "and co", "co kg",
-        "gesellschaft mit beschraenkter haftung", "aktiengesellschaft",
+        # Handle both 'beschraenkter' and 'beschränkter' spellings
+        "gesellschaft mit beschraenkter haftung",
+        "gesellschaft mit beschränkter haftung",
+        "aktiengesellschaft",
         "kommanditgesellschaft", "offene handelsgesellschaft", "eingetragener kaufmann",
         "gmbh", "ag", "kg", "ug", "se", "ek", "ohg", "spa",
     ]
@@ -31,13 +41,41 @@ def _remove_legal_tokens(s: str) -> str:
 
 
 def normalize_korrespondent(name: str) -> str:
-    raw = (name or "").strip()
+    """Normalize a merchant/korrespondent name while preserving umlauts.
+
+    Steps (with debug prints):
+    - Trim and unwrap simple JSON-like `merchant:"..."` shapes.
+    - Normalize to NFC to preserve composed umlauts (ä/ö/ü/Ä/Ö/Ü/ß).
+    - Lowercase (Unicode-aware).
+    - Keep only letters and spaces (Unicode-aware), collapse whitespace.
+    - Remove common German legal form tokens.
+    """
+    raw_input = name or ""
+    raw = raw_input.strip()
     m = re.match(r'^\s*"?(merchant|korrespondent)"?\s*:\s*"?(.+?)"?\s*,?\s*$', raw, flags=re.IGNORECASE)
     if m:
         raw = m.group(2).strip()
-    lowered = raw.lower()
+
+    # Replace NBSP with a normal space and normalize to NFC so combining marks
+    # become composed characters (e.g., 'u' + '\u0308' -> 'ü').
+    raw = raw.replace("\u00A0", " ")
+    nfc = unicodedata.normalize("NFC", raw)
+    lowered = nfc.lower()
     letters_spaces = _only_letters_and_spaces(lowered)
     cleaned = _remove_legal_tokens(letters_spaces)
+
+    # Verbose debug prints for diagnostics
+    try:
+        print(
+            "[normalize_korrespondent] raw=\"{}\" | nfc=\"{}\" | lowered=\"{}\" | letters_only=\"{}\" | cleaned=\"{}\"".format(
+                raw_input, nfc, lowered, letters_spaces, cleaned
+            ),
+            flush=True,
+        )
+    except Exception:
+        # Avoid any logging failures impacting the pipeline
+        pass
+
     return cleaned
 
 
