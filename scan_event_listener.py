@@ -1,11 +1,17 @@
 import os
 import sys
 import time
-from typing import Set, Optional, List
+from typing import Set, Optional, List, Iterable
 
 # Centralized path to 'scan-image-path.txt' defined once
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SCAN_IMAGE_CONFIG_PATH = os.path.join(SCRIPT_DIR, "scan-image-path.txt")
+
+# --- Configuration: watched file extensions ---------------------------------
+# Edit this set to change which file types trigger the watcher. Extensions are
+# case-insensitive, but MUST include the leading dot. Keep it small and clear.
+# Default per request: only .jpg, .jpeg, and .pdf
+WATCH_EXTS: Set[str] = {".jpg", ".jpeg", ".pdf"}
 
 
 def debug_print(msg: str) -> None:
@@ -78,12 +84,30 @@ def read_watch_dir_from_file(config_path: Optional[str] = None) -> str:
     return abs_path
 
 
-def list_jpeg_basenames_in_dir(directory: str) -> Set[str]:
+def _normalize_exts(exts: Iterable[str]) -> Set[str]:
+    """Return a lowercase set of extensions, ensuring they start with a dot.
+
+    Example: ["jpg", ".JPEG"] -> {".jpg", ".jpeg"}
     """
-    Returns a set of JPEG filenames (basenames only) present in the given directory.
-    Only the top-level directory is scanned (non-recursive).
+    out: Set[str] = set()
+    for e in exts:
+        if not e:
+            continue
+        ee = e.lower()
+        if not ee.startswith('.'):
+            ee = '.' + ee
+        out.add(ee)
+    return out
+
+
+def list_basenames_in_dir_by_ext(directory: str, exts: Iterable[str]) -> Set[str]:
+    """Return a set of basenames present in directory filtered by extensions.
+
+    - Non-recursive; top-level only
+    - Case-insensitive match on extension
+    - Returns basenames (not absolute paths)
     """
-    exts = {".jpg", ".jpeg", ".jpe", ".jfif"}
+    watch_exts = _normalize_exts(exts)
     try:
         entries = os.listdir(directory)
     except FileNotFoundError:
@@ -96,14 +120,20 @@ def list_jpeg_basenames_in_dir(directory: str) -> Set[str]:
         debug_print(f"ERROR: Failed to list directory '{directory}': {e}")
         return set()
 
-    files = set()
+    files: Set[str] = set()
     for name in entries:
         full = os.path.join(directory, name)
         if os.path.isfile(full):
             _, ext = os.path.splitext(name)
-            if ext.lower() in exts:
+            if ext.lower() in watch_exts:
                 files.add(name)
     return files
+
+
+# Backwards-compat helper retained (JPEGs only), though internal code now
+# uses list_basenames_in_dir_by_ext with WATCH_EXTS.
+def list_jpeg_basenames_in_dir(directory: str) -> Set[str]:
+    return list_basenames_in_dir_by_ext(directory, {".jpg", ".jpeg", ".jpe", ".jfif"})
 
 
 class ScanEventListener:
@@ -120,6 +150,7 @@ class ScanEventListener:
         config_path: Optional[str] = None,
         poll_interval_sec: float = 1.0,
         print_on_detect: bool = True,
+        exts: Optional[Iterable[str]] = None,
     ) -> None:
         # Resolve watch directory from argument or config file
         if watch_dir:
@@ -152,16 +183,20 @@ class ScanEventListener:
                 debug_print(f"Failed to list parent directory: {e}")
             raise SystemExit(1)
 
+        # Extensions to watch
+        self.exts: Set[str] = _normalize_exts(exts or WATCH_EXTS)
+        debug_print(f"Watching for extensions: {sorted(self.exts)}")
+
         # State
         self.poll_interval_sec = float(poll_interval_sec)
         self.print_on_detect = bool(print_on_detect)
-        self.baseline: Set[str] = list_jpeg_basenames_in_dir(self.watch_dir)
+        self.baseline: Set[str] = list_basenames_in_dir_by_ext(self.watch_dir, self.exts)
         self.last_seen_count: int = len(self.baseline)
         self.last_new_image_path: Optional[str] = None
         self.new_image_paths: List[str] = []
 
-        debug_print(f"Initial JPEG count in {self.watch_dir!r}: {len(self.baseline)}")
-        debug_print("Watching for newly created JPEG files (.jpg, .jpeg, .jpe, .jfif)...")
+        debug_print(f"Initial watched-file count in {self.watch_dir!r}: {len(self.baseline)}")
+        debug_print("Watching for newly created files with configured extensions...")
         debug_print("Press Ctrl+C to exit manually.")
 
     def get_last_new_image_path(self) -> Optional[str]:
@@ -174,9 +209,9 @@ class ScanEventListener:
 
     def scan_once(self) -> List[str]:
         """Scan the directory once and return a list of newly detected absolute paths."""
-        current = list_jpeg_basenames_in_dir(self.watch_dir)
+        current = list_basenames_in_dir_by_ext(self.watch_dir, self.exts)
         if len(current) != self.last_seen_count:
-            debug_print(f"Detected change in JPEG count: {self.last_seen_count} -> {len(current)}")
+            debug_print(f"Detected change in watched-file count: {self.last_seen_count} -> {len(current)}")
             self.last_seen_count = len(current)
 
         new_files = current - self.baseline
@@ -184,13 +219,12 @@ class ScanEventListener:
         if new_files:
             sorted_new = sorted(new_files)
             debug_print(
-                f"Detected {len(sorted_new)} new JPEG(s): {sorted_new}. "
-                f"Printing absolute paths and continuing to watch."
+                f"Detected {len(sorted_new)} new file(s): {sorted_new}. Printing absolute paths and continuing to watch."
             )
             for detected in sorted_new:
                 image_path = os.path.join(self.watch_dir, detected)
                 image_path = os.path.abspath(image_path)
-                debug_print(f"New JPEG: {detected!r} at {image_path!r}")
+                debug_print(f"New file: {detected!r} at {image_path!r}")
                 if self.print_on_detect:
                     print(image_path, flush=True)
                 self.last_new_image_path = image_path
@@ -222,4 +256,3 @@ if __name__ == "__main__":
     except Exception as e:
         debug_print(f"FATAL: Unhandled exception: {e}")
         sys.exit(1)
-

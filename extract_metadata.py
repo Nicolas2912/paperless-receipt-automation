@@ -45,6 +45,159 @@ DEFAULT_OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5vl-receipt:latest")
 
 
+# =======================
+# PDF TEXT EXTRACTION PATH
+# =======================
+# The code below adds a non-LLM, PyMuPDF-based extractor specifically for PDFs.
+# JPEG images continue to use the existing LLM vision path. The PDF path aims
+# to be deterministic and fast for structured invoices like REWE.
+
+class PDFMetadataExtractor:
+    """Rule-based extractor for searchable PDFs (no LLM involved).
+
+    Extraction rules requested for REWE invoices:
+    - korrespondent: if the document contains "REWE Markt GmbH" set to "REWE"
+      (with normalization later). If not found, attempt a light fallback by
+      checking for the standalone token "REWE".
+    - ausstellungsdatum: find the label "Rechnungsdatum" and parse the nearest
+      date (same line or next line). Output as YYYY-MM-DD.
+    - betrag_value: find the label "Summe" and parse the nearest amount
+      (same line or next line). Normalize to dot decimal with two places.
+    - betrag_currency: always "EUR".
+    - dokumenttyp: always "Rechnung".
+
+    Logging is verbose so you can see exactly which rule fired.
+    """
+
+    DATE_PAT = re.compile(r"(\d{1,2})[./](\d{1,2})[./](\d{2,4})|\b(\d{4})-(\d{2})-(\d{2})\b")
+    AMOUNT_PAT = re.compile(r"(?<!\d)(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})(?!\d)")
+
+    @staticmethod
+    def _read_pdf_lines(path: str) -> list[str]:
+        try:
+            import fitz  # PyMuPDF
+        except Exception as e:
+            debug(f"ERROR: PyMuPDF is required for PDF extraction: {e}")
+            raise
+        doc = fitz.open(path)
+        lines: list[str] = []
+        debug(f"[pdf] Opened PDF with {doc.page_count} page(s)")
+        for i in range(doc.page_count):
+            page = doc.load_page(i)
+            text = page.get_text("text") or ""
+            page_lines = [ln.rstrip("\r") for ln in text.splitlines()]
+            debug(f"[pdf] Page {i+1}: lines={len(page_lines)} chars={len(text)}")
+            lines.extend(page_lines)
+        doc.close()
+        return lines
+
+    @staticmethod
+    def _find_korrespondent(lines: list[str]) -> str | None:
+        joined = "\n".join(lines)
+        if re.search(r"rewe\s+markt\s+gmbh", joined, re.IGNORECASE):
+            debug("[pdf] Found vendor phrase 'REWE Markt GmbH' → korrespondent=REWE")
+            return "REWE"
+        # Light fallback: presence of 'REWE' anywhere
+        if re.search(r"\bREWE\b", joined, re.IGNORECASE):
+            debug("[pdf] Fallback vendor hit for 'REWE' token → korrespondent=REWE")
+            return "REWE"
+        debug("[pdf] Vendor not found via rules")
+        return None
+
+    @staticmethod
+    def _find_date_near_label(lines: list[str], label: str) -> str | None:
+        lab_pat = re.compile(re.escape(label), re.IGNORECASE)
+        for idx, line in enumerate(lines):
+            if not lab_pat.search(line):
+                continue
+            debug(f"[pdf] Label '{label}' found on line {idx+1}: {line!r}")
+            # Try same line
+            m = PDFMetadataExtractor.DATE_PAT.search(line)
+            if m:
+                cand = m.group(0)
+                iso = _normalize_date_iso(cand)
+                debug(f"[pdf] Date on same line: {cand!r} → {iso}")
+                if iso:
+                    return iso
+            # Try next line if exists
+            if idx + 1 < len(lines):
+                nxt = lines[idx + 1]
+                m2 = PDFMetadataExtractor.DATE_PAT.search(nxt)
+                if m2:
+                    cand = m2.group(0)
+                    iso = _normalize_date_iso(cand)
+                    debug(f"[pdf] Date on next line: {cand!r} → {iso}")
+                    if iso:
+                        return iso
+        debug(f"[pdf] No date found near label '{label}'")
+        return None
+
+    @staticmethod
+    def _find_amount_near_label(lines: list[str], label: str) -> str | None:
+        lab_pat = re.compile(re.escape(label), re.IGNORECASE)
+        for idx, line in enumerate(lines):
+            if not lab_pat.search(line):
+                continue
+            debug(f"[pdf] Label '{label}' found on line {idx+1}: {line!r}")
+            # Same line first
+            m = PDFMetadataExtractor.AMOUNT_PAT.search(line)
+            if m:
+                raw = m.group(1)
+                norm = _normalize_amount(raw)
+                debug(f"[pdf] Amount on same line: {raw!r} → {norm}")
+                if norm:
+                    return norm
+            # Next line fallback
+            if idx + 1 < len(lines):
+                nxt = lines[idx + 1]
+                m2 = PDFMetadataExtractor.AMOUNT_PAT.search(nxt)
+                if m2:
+                    raw = m2.group(1)
+                    norm = _normalize_amount(raw)
+                    debug(f"[pdf] Amount on next line: {raw!r} → {norm}")
+                    if norm:
+                        return norm
+        debug(f"[pdf] No amount found near label '{label}'")
+        return None
+
+    @staticmethod
+    def extract(path: str) -> Optional["ExtractedMetadata"]:
+        lines = PDFMetadataExtractor._read_pdf_lines(path)
+        if not lines:
+            debug("[pdf] No text lines extracted from PDF")
+        # Vendor
+        kor = PDFMetadataExtractor._find_korrespondent(lines) or "Unbekannt"
+        # Date
+        date_iso = PDFMetadataExtractor._find_date_near_label(lines, "Rechnungsdatum") or "1970-01-01"
+        # Amount
+        amt = PDFMetadataExtractor._find_amount_near_label(lines, "Summe") or "0.00"
+        # Fixed fields
+        cur = "EUR"
+        dtype = "Rechnung"
+
+        # Normalize merchant as the rest of the pipeline expects
+        try:
+            from merchant_normalization import normalize_korrespondent as _norm_k  # type: ignore
+            kor_norm = _norm_k(kor)
+        except Exception:
+            kor_norm = kor
+
+        md = ExtractedMetadata(
+            korrespondent=kor_norm or "Unbekannt",
+            ausstellungsdatum=date_iso,
+            betrag_value=amt,
+            betrag_currency=cur,
+            dokumenttyp=dtype,
+        )
+        debug(
+            "[pdf] Extracted: korrespondent='{}', date={}, amount={} {} type={}".format(
+                md.korrespondent, md.ausstellungsdatum, md.betrag_value, md.betrag_currency, md.dokumenttyp
+            )
+        )
+        debug(f"[pdf] Generated base title: {md.title()}")
+        return md
+
+
 def _encode_image_to_b64(path: str) -> str:
     """Return base64 image data. If source is a PDF, render first page to PNG.
 
@@ -74,16 +227,39 @@ def _fix_windows_path_input(p: str) -> str:
     """Best-effort repair for common Windows path paste issues.
 
     - If user passes "C:Users..." (missing backslash after drive), insert it.
+    - Heuristically insert separators between common tokens when missing
+      (Users, <username>, Downloads, Desktop, Documents/Dokumente).
     - Trim surrounding quotes/spaces.
     """
     try:
         s = (p or "").strip().strip('"').strip("'")
         if os.name == "nt":
+            # Ensure backslash after drive
             if re.match(r"^[A-Za-z]:(?![\\/])", s):
                 fixed = s[:2] + "\\" + s[2:]
                 if fixed != s:
                     debug(f"Repaired Windows path input: '{s}' -> '{fixed}'")
                 s = fixed
+            # If string still lacks separators (common paste), try inserting
+            # them before well-known path tokens.
+            if re.match(r"^[A-Za-z]:\\[^\\/]+$", s) or ("\\" not in s and "/" not in s):
+                tokens = [
+                    "Users",
+                    os.environ.get("USERNAME", "Anwender"),
+                    "Anwender",  # fallback explicit user seen in repo
+                    "Downloads",
+                    "Desktop",
+                    "Documents",
+                    "Dokumente",
+                ]
+                for tok in tokens:
+                    if not tok:
+                        continue
+                    # Insert a backslash before and after token when missing
+                    s = re.sub(rf"(?i)(?<![\\/]){re.escape(tok)}(?![\\/])", rf"\\{tok}\\", s)
+                # Collapse duplicated separators
+                s = re.sub(r"[\\/]{2,}", r"\\", s)
+                debug(f"Applied token-based path repair → {s}")
         return s
     except Exception:
         return p
@@ -270,6 +446,13 @@ def extract_from_source(
         debug(f"ERROR: Source not found: {source_path}")
         return None
 
+    _, ext = os.path.splitext(source_path)
+    if ext.lower() == ".pdf":
+        debug("[route] PDF detected → using PDFMetadataExtractor (no LLM)")
+        return PDFMetadataExtractor.extract(source_path)
+
+    # JPEG and other raster images → keep existing LLM-based path
+    debug("[route] Non-PDF detected → using LLM vision extractor")
     obj = _ollama_chat_vision(source_path, model=model, ollama_url=ollama_url)
     if obj is None:
         return None
@@ -286,24 +469,34 @@ def extract_from_source(
         betrag_currency=cur,
     )
     debug(
-        "Extracted: korrespondent='{}', date={}, amount={} {}".format(
+        "[llm] Extracted: korrespondent='{}', date={}, amount={} {}".format(
             md.korrespondent, md.ausstellungsdatum, md.betrag_value, md.betrag_currency
         )
     )
-    debug(f"Generated base title: {md.title()}")
+    debug(f"[llm] Generated base title: {md.title()}")
     return md
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Extract receipt metadata via Ollama (qwen2.5vl-receipt)")
-    ap.add_argument("--source", required=True, help="Path to receipt image or PDF (first page will be used by the model)")
-    ap.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL, help="Ollama base URL (default from OLLAMA_URL or http://localhost:11434)")
-    ap.add_argument("--model", default=DEFAULT_MODEL, help="Ollama model name (default qwen2.5vl-receipt:latest)")
+    ap = argparse.ArgumentParser(description="Extract receipt metadata (PDF path uses PyMuPDF; images use LLM vision)")
+    ap.add_argument("--source", help="Path to receipt image or PDF. If omitted with --test-rewe, uses the REWE example path.")
+    ap.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL, help="Ollama base URL (used for non-PDF images)")
+    ap.add_argument("--model", default=DEFAULT_MODEL, help="Ollama model name (used for non-PDF images)")
+    ap.add_argument("--test-rewe", action="store_true", help="Use hardcoded path for quick testing")
     # Note: ASN is not used; no Paperless API lookup is needed here.
     args = ap.parse_args()
 
     debug("Starting extract_metadata.py")
-    md = extract_from_source(args.source, ollama_url=args.ollama_url, model=args.model)
+    src = args.source
+    if not src and args.test_rewe:
+        src = r"C:\Users\Anwender\Downloads\Rechnung_PN25064804420414.pdf"
+        debug("Using --test-rewe sample path")
+
+    if not src:
+        debug("FATAL: Provide --source or use --test-rewe for the sample file.")
+        sys.exit(2)
+
+    md = extract_from_source(src, ollama_url=args.ollama_url, model=args.model)
     if md is None:
         debug("FATAL: Extraction failed")
         sys.exit(1)
@@ -315,5 +508,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

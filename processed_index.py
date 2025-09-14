@@ -77,6 +77,26 @@ def compute_file_hash(path: str, chunk_size: int = 1024 * 1024) -> str:
     return h.hexdigest()
 
 
+def _normalize_exts(exts):
+    """Normalize extensions to lowercase with a leading dot.
+
+    Accepts any iterable of strings; returns a list preserving insertion order
+    without duplicates.
+    """
+    out = []
+    seen = set()
+    for e in exts:
+        if not e:
+            continue
+        ee = str(e).lower()
+        if not ee.startswith('.'):
+            ee = '.' + ee
+        if ee not in seen:
+            seen.add(ee)
+            out.append(ee)
+    return out
+
+
 def is_processed(db_path: str, file_hash: str) -> bool:
     conn = _connect(db_path)
     try:
@@ -218,18 +238,34 @@ def _api_find_document_by_original_filename(
     return None
 
 
-def list_jpeg_basenames_in_dir(directory: str) -> List[str]:
-    exts = {".jpg", ".jpeg", ".jpe", ".jfif"}
+def _list_basenames_in_dir_by_ext(directory: str, exts) -> List[str]:
+    """Return sorted basenames in directory matching the given extensions.
+
+    - Non-recursive
+    - Case-insensitive
+    - Robust debug on errors
+    """
+    want = set(_normalize_exts(exts))
     try:
-        names = []
+        names: List[str] = []
         for name in os.listdir(directory):
             full = os.path.join(directory, name)
-            if os.path.isfile(full) and os.path.splitext(name)[1].lower() in exts:
+            if os.path.isfile(full) and os.path.splitext(name)[1].lower() in want:
                 names.append(name)
         return sorted(names)
     except Exception as e:
         debug(f"ERROR listing directory '{directory}': {e}")
         return []
+
+
+def list_jpeg_basenames_in_dir(directory: str) -> List[str]:
+    """Backward-compatible helper: only common JPEG extensions."""
+    return _list_basenames_in_dir_by_ext(directory, {".jpg", ".jpeg", ".jpe", ".jfif"})
+
+
+def list_pdf_basenames_in_dir(directory: str) -> List[str]:
+    """New helper: list .pdf basenames in directory."""
+    return _list_basenames_in_dir_by_ext(directory, {".pdf"})
 
 
 def initial_sync_with_paperless(
@@ -243,17 +279,20 @@ def initial_sync_with_paperless(
     Bring local DB in sync with Paperless for files currently in the watch dir.
 
     Strategy:
-    - For each JPEG in watch_dir, compute content hash.
+    - For each JPEG and PDF in watch_dir, compute content hash.
     - If already in DB: mark seen and continue.
     - Else: try to find a Paperless document by using the image basename (without
       extension) as the title (this matches the current flow which renames image
-      and PDF consistently before upload).
+      and PDF consistently before upload). For PDFs, prefer exact match on
+      original_filename.
     - When found, store the mapping in DB so future runs skip the file.
     """
     debug("Starting initial sync between SQLite and Paperless…")
     debug(f"Watch dir for sync: {watch_dir}")
-    names = list_jpeg_basenames_in_dir(watch_dir)
-    debug(f"Found {len(names)} JPEG(s) in watch dir for sync")
+    jpeg_names = list_jpeg_basenames_in_dir(watch_dir)
+    pdf_names = list_pdf_basenames_in_dir(watch_dir)
+    names = sorted(set(jpeg_names) | set(pdf_names))
+    debug(f"Found {len(jpeg_names)} JPEG(s) and {len(pdf_names)} PDF(s); total considered={len(names)}")
 
     synced = 0
     already = 0
