@@ -6,16 +6,33 @@ import sys
 import tempfile
 from typing import Optional
 
+# Shared logging (Phase 1) must be available early
+try:
+    from src.paperless_automation.logging import get_logger  # type: ignore
+except Exception:
+    def get_logger(name: str):  # type: ignore
+        class _L:
+            def info(self, m):
+                print(f"[{name}] {m}")
+            debug = info
+            warning = info
+            error = info
+        return _L()
+
+_LOG = get_logger("preconsume-overlay-pdf")
+
 try:
     import fitz  # PyMuPDF
 except Exception as e:
-    print("[ERROR] PyMuPDF (package 'pymupdf') is required: ", e, file=sys.stderr)
+    _LOG.error(f"PyMuPDF (package 'pymupdf') is required: {e}")
     raise
 
 try:
     import requests  # optional, for Ollama
 except Exception:
     requests = None
+
+# (logger already initialized above)
 
 # Try to import the project's transcriber utilities so we use the exact logic
 try:
@@ -33,7 +50,7 @@ except Exception as e:
         "Transcribe this receipt EXACTLY (spacing, order). Output plain text only. "
         "When finished, print <eot> on a new line."
     )
-    print(f"[WARN] Could not import ollama_transcriber: {e}. Falling back to internal defaults.")
+    _LOG.warning(f"Could not import ollama_transcriber: {e}. Falling back to internal defaults.")
 
 # Reuse the project's scan directory watcher
 try:
@@ -41,12 +58,12 @@ try:
 except Exception as e:
     ScanEventListener = None  # type: ignore
     def scan_debug(msg: str) -> None:
-        print(f"[scan-listener] {msg}")
-    print(f"[WARN] Could not import ScanEventListener: {e}")
+        _LOG.info(f"[scan-listener] {msg}")
+    _LOG.warning(f"Could not import ScanEventListener: {e}")
 
 
 def log_env_overview():
-    print("[INFO] Environment overview for debugging:")
+    _LOG.info("Environment overview for debugging:")
     for key in [
         "DOCUMENT_WORKING_PATH",
         "PAPERLESS_PRE_CONSUME_SCRIPT",
@@ -54,7 +71,7 @@ def log_env_overview():
         "OLLAMA_URL",
         "OLLAMA_MODEL",
     ]:
-        print(f"  - {key} = {os.environ.get(key)}")
+        _LOG.info(f"  - {key} = {os.environ.get(key)}")
 
 
 def pixmap_from_any(path: str) -> fitz.Pixmap:
@@ -65,11 +82,11 @@ def pixmap_from_any(path: str) -> fitz.Pixmap:
     """
     ext = os.path.splitext(path)[1].lower()
     if ext in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}:
-        print(f"[DEBUG] Loading raster image as Pixmap: {path}")
+        _LOG.debug(f"Loading raster image as Pixmap: {path}")
         return fitz.Pixmap(path)
 
     if ext == ".pdf":
-        print(f"[DEBUG] Rendering first page of PDF to Pixmap: {path}")
+        _LOG.debug(f"Rendering first page of PDF to Pixmap: {path}")
         with fitz.open(path) as doc:
             if doc.page_count == 0:
                 raise RuntimeError("Input PDF has no pages")
@@ -85,25 +102,25 @@ def create_pdf_with_invisible_text(image_path: str, text: str, output_pdf: str) 
     """Create a single-page PDF with the image as the page background and
     embed `text` as invisible text (render_mode=3) occupying the page.
     """
-    print(f"[INFO] Creating PDF with invisible text overlay")
-    print(f"[DEBUG] Image path: {image_path}")
-    print(f"[DEBUG] Output PDF: {output_pdf}")
+    _LOG.info("Creating PDF with invisible text overlay")
+    _LOG.debug(f"Image path: {image_path}")
+    _LOG.debug(f"Output PDF: {output_pdf}")
 
     # Determine image dimensions
     pix = pixmap_from_any(image_path)
     width, height = pix.width, pix.height
-    print(f"[DEBUG] Image dimensions (px): {width} x {height}")
+    _LOG.debug(f"Image dimensions (px): {width} x {height}")
 
     # Build PDF
     doc = fitz.open()
     page = doc.new_page(width=width, height=height)
     rect = fitz.Rect(0, 0, width, height)
     # Place image to fill page
-    print("[DEBUG] Inserting image onto the page")
+    _LOG.debug("Inserting image onto the page")
     ext = os.path.splitext(image_path)[1].lower()
     if ext == ".pdf":
         # Insert rendered pixmap as image stream
-        print("[DEBUG] Input is PDF; inserting rendered first page as image stream")
+        _LOG.debug("Input is PDF; inserting rendered first page as image stream")
         img_bytes = pix.tobytes("png")
         page.insert_image(rect, stream=img_bytes, keep_proportion=False)
     else:
@@ -114,7 +131,7 @@ def create_pdf_with_invisible_text(image_path: str, text: str, output_pdf: str) 
     fontsize = 10
     margin = 20
     textbox = fitz.Rect(margin, margin, width - margin, height - margin)
-    print("[DEBUG] Inserting invisible text layer (render_mode=3)")
+    _LOG.debug("Inserting invisible text layer (render_mode=3)")
     page.insert_textbox(
         textbox,
         text,
@@ -126,24 +143,24 @@ def create_pdf_with_invisible_text(image_path: str, text: str, output_pdf: str) 
     )
 
     # Save atomically
-    print("[DEBUG] Saving PDF")
+    _LOG.debug("Saving PDF")
     doc.save(output_pdf)
     doc.close()
-    print(f"[INFO] PDF created: {output_pdf}")
+    _LOG.info(f"PDF created: {output_pdf}")
 
 
 def ensure_dir(path: str) -> str:
     """Create a directory if missing; return its absolute path."""
     absdir = os.path.abspath(os.path.expanduser(os.path.expandvars(path)))
     if not os.path.isdir(absdir):
-        print(f"[INFO] Output directory does not exist. Creating: {absdir}")
+        _LOG.info(f"Output directory does not exist. Creating: {absdir}")
         try:
             os.makedirs(absdir, exist_ok=True)
         except Exception as e:
-            print(f"[ERROR] Failed to create output directory '{absdir}': {e}", file=sys.stderr)
+            _LOG.error(f"Failed to create output directory '{absdir}': {e}")
             raise
     else:
-        print(f"[DEBUG] Output directory exists: {absdir}")
+        _LOG.debug(f"Output directory exists: {absdir}")
     return absdir
 
 
@@ -164,7 +181,7 @@ def encode_pixmap_base64(pix: fitz.Pixmap, image_format: str = "png") -> str:
     """Return base64-encoded raw image data (not data URL), matching ollama_transcriber."""
     if image_format not in {"png", "jpeg"}:
         image_format = "png"
-    print(f"[DEBUG] Encoding pixmap to base64 as {image_format}")
+    _LOG.debug(f"Encoding pixmap to base64 as {image_format}")
     img_bytes = pix.tobytes(output=image_format)
     return base64.b64encode(img_bytes).decode("ascii")
 
@@ -175,7 +192,7 @@ def _raw_file_b64(path: str) -> Optional[str]:
             data = f.read()
         return base64.b64encode(data).decode("ascii")
     except Exception as e:
-        print(f"[ERROR] Failed to read file for base64: {e}")
+        _LOG.error(f"Failed to read file for base64: {e}")
         return None
 
 
@@ -188,7 +205,7 @@ def call_ollama_vision(
 ) -> Optional[str]:
     """Delegate to the project's transcriber function if available, else None."""
     if transcribe_image_via_ollama is None:
-        print("[ERROR] transcribe_image_via_ollama not available; ensure ollama_transcriber.py is importable.")
+        _LOG.error("transcribe_image_via_ollama not available; ensure ollama_transcriber.py is importable.")
         return None
     # The transcriber function expects instruction text in 'instruction'.
     # It will use the provided url/model and stream results.
@@ -206,15 +223,15 @@ def guess_text_source(
 ) -> Optional[str]:
     # 1) --text has highest priority
     if args.text:
-        print("[INFO] Using text provided via --text")
+        _LOG.info("Using text provided via --text")
         return args.text
 
     # 2) --text-file
     if args.text_file:
         if not os.path.isfile(args.text_file):
-            print(f"[ERROR] --text-file not found: {args.text_file}")
+            _LOG.error(f"--text-file not found: {args.text_file}")
             return None
-        print(f"[INFO] Reading text from file: {args.text_file}")
+        _LOG.info(f"Reading text from file: {args.text_file}")
         with open(args.text_file, "r", encoding="utf-8", errors="ignore") as f:
             return f.read()
 
@@ -226,10 +243,10 @@ def guess_text_source(
         prompt = args.prompt or TRANSCRIBER_INSTRUCTION
         text = call_ollama_vision(image_path, prompt, ollama_url, ollama_model)
         if text:
-            print("[INFO] Using text returned by Ollama")
+            _LOG.info("Using text returned by Ollama")
             return text
         else:
-            print("[WARN] Ollama did not return text. Provide --text or --text-file.")
+            _LOG.warning("Ollama did not return text. Provide --text or --text-file.")
 
     return None
 
@@ -239,19 +256,19 @@ def replace_inplace(original_path: str, new_pdf_path: str) -> None:
     Note: Paperless pre-consume allows replacing the working file path; the
     file extension may not match its content after replacement, which is fine for the consumer.
     """
-    print(f"[INFO] Replacing working file in place")
-    print(f"[DEBUG] Original path: {original_path}")
-    print(f"[DEBUG] New PDF path:  {new_pdf_path}")
+    _LOG.info("Replacing working file in place")
+    _LOG.debug(f"Original path: {original_path}")
+    _LOG.debug(f"New PDF path:  {new_pdf_path}")
     # On Windows, os.replace does an atomic move when possible.
     os.replace(new_pdf_path, original_path)
-    print("[INFO] Replacement completed")
+    _LOG.info("Replacement completed")
 
 
 def run_preconsume_mode():
     log_env_overview()
     working_path = os.environ.get("DOCUMENT_WORKING_PATH")
     if not working_path:
-        print("[ERROR] DOCUMENT_WORKING_PATH not set. Are you running under Paperless pre-consume?", file=sys.stderr)
+        _LOG.error("DOCUMENT_WORKING_PATH not set. Are you running under Paperless pre-consume?")
         sys.exit(2)
 
     # Build a minimal args namespace for guess_text_source
@@ -264,13 +281,13 @@ def run_preconsume_mode():
     )
 
     if not os.path.isfile(working_path):
-        print(f"[ERROR] Working file not found: {working_path}", file=sys.stderr)
+        _LOG.error(f"Working file not found: {working_path}")
         sys.exit(2)
 
     # Choose text source (text, text-file, or Ollama via env)
     text = guess_text_source(args, working_path)
     if not text:
-        print("[ERROR] No text available for overlay. Provide --text/--text-file or set OLLAMA_URL.", file=sys.stderr)
+        _LOG.error("No text available for overlay. Provide --text/--text-file or set OLLAMA_URL.")
         sys.exit(3)
 
     # Create PDF to a temp file then replace
@@ -279,7 +296,7 @@ def run_preconsume_mode():
         create_pdf_with_invisible_text(working_path, text, tmp_pdf)
         replace_inplace(working_path, tmp_pdf)
 
-    print("[INFO] Pre-consume finished successfully")
+    _LOG.info("Pre-consume finished successfully")
 
 
 def run_watch_mode(args: argparse.Namespace) -> None:
@@ -287,7 +304,7 @@ def run_watch_mode(args: argparse.Namespace) -> None:
     write a PDF with an invisible text layer to the specified output folder.
     """
     if ScanEventListener is None:
-        print("[ERROR] scan_event_listener.py not importable; cannot run watch mode.", file=sys.stderr)
+        _LOG.error("scan_event_listener.py not importable; cannot run watch mode.")
         sys.exit(2)
 
     outdir = ensure_dir(args.output_dir)
@@ -298,8 +315,8 @@ def run_watch_mode(args: argparse.Namespace) -> None:
         poll_interval_sec=float(args.poll_interval),
     )
     scan_debug(f"Watch mode active. Watching: {listener.watch_dir}")
-    print(f"[INFO] Saving generated PDFs to: {outdir}")
-    print("[INFO] Press Ctrl+C to stop.")
+    _LOG.info(f"Saving generated PDFs to: {outdir}")
+    _LOG.info("Press Ctrl+C to stop.")
 
     try:
         while True:
@@ -310,26 +327,26 @@ def run_watch_mode(args: argparse.Namespace) -> None:
                 continue
 
             for image_path in new_paths:
-                print(f"[INFO] Detected new scan: {image_path}")
+                _LOG.info(f"Detected new scan: {image_path}")
                 # Build output path
                 base = os.path.splitext(os.path.basename(image_path))[0]
                 target_pdf = os.path.join(outdir, f"{base}.pdf")
                 target_pdf = unique_path(target_pdf)
-                print(f"[DEBUG] Target PDF path: {target_pdf}")
+                _LOG.debug(f"Target PDF path: {target_pdf}")
 
                 # Get text via args or Ollama
                 text = guess_text_source(args, image_path)
                 if not text:
-                    print("[WARN] No text available from Ollama/args; skipping PDF creation for this file.")
+                    _LOG.warning("No text available from Ollama/args; skipping PDF creation for this file.")
                     continue
 
                 try:
                     create_pdf_with_invisible_text(image_path, text, target_pdf)
                 except Exception as e:
-                    print(f"[ERROR] Failed creating PDF for '{image_path}': {e}", file=sys.stderr)
+                    _LOG.error(f"Failed creating PDF for '{image_path}': {e}")
                     continue
     except KeyboardInterrupt:
-        print("[INFO] Watch mode interrupted by user. Exiting.")
+        _LOG.info("Watch mode interrupted by user. Exiting.")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -377,25 +394,25 @@ def main():
         return
 
     if args.mode == "cli":
-        print("[INFO] Running in CLI mode")
+        _LOG.info("Running in CLI mode")
         image = args.image
         output = args.output
 
         if not os.path.isfile(image):
-            print(f"[ERROR] Input not found: {image}", file=sys.stderr)
+            _LOG.error(f"Input not found: {image}")
             sys.exit(2)
 
         text = guess_text_source(args, image)
         if not text:
-            print("[ERROR] No text available. Provide --text/--text-file or --ollama-url.", file=sys.stderr)
+            _LOG.error("No text available. Provide --text/--text-file or --ollama-url.")
             sys.exit(3)
 
         create_pdf_with_invisible_text(image, text, output)
-        print("[INFO] CLI finished successfully")
+        _LOG.info("CLI finished successfully")
         return
 
     if args.mode == "watch":
-        print("[INFO] Running in WATCH mode")
+        _LOG.info("Running in WATCH mode")
         run_watch_mode(args)
         return
 

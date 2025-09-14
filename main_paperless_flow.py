@@ -5,6 +5,25 @@ from typing import Optional, Dict, Any, List
 import re
 import requests as _rq
 
+# New shared foundations (Phase 1)
+try:
+    from src.paperless_automation.logging import get_logger  # type: ignore
+    from src.paperless_automation.config import load_token as _cfg_load_token, load_tag_map as _cfg_load_tag_map  # type: ignore
+except Exception:
+    # Fallbacks keep behavior identical if src/ isn't available at runtime
+    def get_logger(name: str):  # type: ignore
+        class _L:
+            def info(self, m):
+                print(f"[{name}] {m}", flush=True)
+            debug = info
+            warning = info
+            error = info
+        return _L()
+    def _cfg_load_token(dotenv_dir: str):  # type: ignore
+        return None
+    def _cfg_load_tag_map(script_dir: str):  # type: ignore
+        return {}
+
 # Local components
 try:
     from scan_event_listener import (
@@ -102,59 +121,23 @@ except Exception as e:
     print(f"[WARN] Could not import processed_index: {e}", flush=True)
 
 
+_LOG = get_logger("main-paperless-flow")
+
+
 def debug(msg: str) -> None:
-    print(f"[main-paperless-flow] {msg}", flush=True)
+    _LOG.info(msg)
 
 
 def load_token(dotenv_dir: str) -> Optional[str]:
-    # Mirror upload_paperless _load_token_from_env_or_dotenv behavior
-    tok = os.environ.get("PAPERLESS_TOKEN")
+    """Delegate to centralized config loader (no behavior change)."""
+    tok = _cfg_load_token(dotenv_dir)
     if tok:
-        debug("Using PAPERLESS_TOKEN from environment.")
-        return tok.strip()
-    dotenv_path = os.path.join(dotenv_dir, ".env")
-    if not os.path.isfile(dotenv_path):
-        debug(f"No .env found at: {dotenv_path}")
-        return None
-    debug(f"Attempting to read PAPERLESS_TOKEN from .env: {dotenv_path}")
-    try:
-        with open(dotenv_path, "r", encoding="utf-8") as f:
-            for raw in f:
-                line = raw.strip()
-                if not line or line.startswith("#") or line.startswith(";"):
-                    continue
-                if "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                if k.strip() != "PAPERLESS_TOKEN":
-                    continue
-                v = v.strip()
-                if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
-                    v = v[1:-1]
-                v = v.strip()
-                if v:
-                    debug("Loaded PAPERLESS_TOKEN from .env file.")
-                    return v
-    except Exception as e:
-        debug(f"Failed reading .env file: {e}")
+        return tok
     return None
 
 
 def load_tag_map(script_dir: str) -> Dict[str, str]:
-    tag_map_path = os.path.join(script_dir, "tag_map.json")
-    if not os.path.isfile(tag_map_path):
-        debug("No tag_map.json found; proceeding without tag mapping.")
-        return {}
-    try:
-        import json
-        with open(tag_map_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            debug(f"Loaded tag_map.json with {len(data)} entries")
-            return data
-    except Exception as e:
-        debug(f"WARN: Failed to read tag_map.json: {e}")
-    return {}
+    return _cfg_load_tag_map(script_dir)
 
 
 def transcribe_to_text(image_path: str, *, ollama_url: str, ollama_model: str) -> Optional[str]:

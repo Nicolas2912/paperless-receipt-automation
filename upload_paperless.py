@@ -8,6 +8,13 @@ import requests
 import re
 import time
 
+# Shared logging & paths (Phase 1)
+try:
+    from src.paperless_automation.paths import fix_windows_path_input as _fix_input  # type: ignore
+except Exception:
+    def _fix_input(p: str) -> str:  # type: ignore
+        return p
+
 try:
     from extract_metadata import extract_from_source, ExtractedMetadata  # type: ignore
 except Exception as e:
@@ -29,8 +36,29 @@ except Exception:
         return "NO TAG FOUND"
 
 
+# New shared foundations (Phase 1)
+try:
+    from src.paperless_automation.logging import get_logger  # type: ignore
+    from src.paperless_automation.config import load_token as _cfg_load_token, load_tag_map as _cfg_load_tag_map  # type: ignore
+except Exception:
+    def get_logger(name: str):  # type: ignore
+        class _L:
+            def info(self, m):
+                print(f"[{name}] {m}", flush=True)
+            debug = info
+            warning = info
+            error = info
+        return _L()
+    def _cfg_load_token(dotenv_dir: str):  # type: ignore
+        return None
+    def _cfg_load_tag_map(script_dir: str):  # type: ignore
+        return {}
+
+_LOG = get_logger("paperless-uploader")
+
+
 def debug(msg: str) -> None:
-    print(f"[paperless-uploader] {msg}", flush=True)
+    _LOG.info(msg)
 
 
 def build_endpoint(base_url: str) -> str:
@@ -44,67 +72,15 @@ def guess_mime(path: str) -> str:
 
 
 def _fix_windows_path_input(p: str) -> str:
-    """Best-effort repair for common Windows path paste issues.
-
-    - If user passes "C:Users..." (missing backslash after drive), insert it.
-    - Trim surrounding quotes/spaces.
-    """
-    try:
-        s = (p or "").strip().strip('"').strip("'")
-        if os.name == "nt":
-            if re.match(r"^[A-Za-z]:(?![\\/])", s):
-                fixed = s[:2] + "\\" + s[2:]
-                if fixed != s:
-                    debug(f"Repaired Windows path input: '{s}' -> '{fixed}'")
-                s = fixed
-        return s
-    except Exception:
-        return p
+    # Delegate to centralized helper for consistency
+    return _fix_input(p)
 
 
 
 def _load_token_from_env_or_dotenv(dotenv_path: str) -> Optional[str]:
-    """Load PAPERLESS_TOKEN from the environment or a .env file next to this script.
-
-    - Only reads PAPERLESS_TOKEN.
-    - Ignores blank lines and comment lines starting with # or ;
-    - Trims surrounding single/double quotes around the value.
-    - Emits debug prints without leaking the actual token.
-    """
-    tok = os.environ.get("PAPERLESS_TOKEN")
-    if tok:
-        debug("Using PAPERLESS_TOKEN from environment.")
-        return tok.strip()
-
-    if not os.path.isfile(dotenv_path):
-        debug(f"No .env found at: {dotenv_path}")
-        return None
-
-    debug(f"Attempting to read PAPERLESS_TOKEN from .env: {dotenv_path}")
-    try:
-        with open(dotenv_path, "r", encoding="utf-8") as f:
-            for raw in f:
-                line = raw.strip()
-                if not line or line.startswith("#") or line.startswith(";"):
-                    continue
-                if "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                if k.strip() != "PAPERLESS_TOKEN":
-                    continue
-                v = v.strip()
-                if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
-                    v = v[1:-1]
-                v = v.strip()
-                if v:
-                    debug("Loaded PAPERLESS_TOKEN from .env file.")
-                    return v
-    except Exception as e:
-        debug(f"Failed reading .env file: {e}")
-        return None
-
-    debug("PAPERLESS_TOKEN not found in .env")
-    return None
+    # Delegate to centralized config; keep function name for compatibility.
+    script_dir = os.path.dirname(os.path.abspath(dotenv_path)) or os.getcwd()
+    return _cfg_load_token(script_dir)
 
 
 # -------------- Paperless helper API --------------
@@ -389,17 +365,7 @@ def main():
     debug(f"Token source: {debug_source}")
 
     # Load tag mapping
-    tag_map_path = os.path.join(script_dir, "tag_map.json")
-    tag_map: Dict[str, str] = {}
-    try:
-        if os.path.isfile(tag_map_path):
-            with open(tag_map_path, "r", encoding="utf-8") as f:
-                tag_map = json.load(f)
-            debug(f"Loaded tag map: {len(tag_map)} entries from {tag_map_path}")
-        else:
-            debug("No tag_map.json found; tags will be empty unless provided manually.")
-    except Exception as e:
-        debug(f"WARN: Failed to read tag_map.json: {e}")
+    tag_map: Dict[str, str] = _cfg_load_tag_map(script_dir)
 
     # Normalize possibly broken Windows path inputs early (spaces, C:Users...)
     try:
@@ -458,28 +424,39 @@ def main():
                     betrag_value=str(md_json.get("betrag_value") or "0.00"),
                     betrag_currency=str(md_json.get("betrag_currency") or "EUR").upper(),
                 )
+
+            # Resolve canonical merchant via tag_map key first
+            canonical_kor = None
+            if md is not None:
+                tag_name, matched_key = _resolve_tag_and_key(tag_map if isinstance(tag_map, dict) else {}, md.korrespondent)
+                if matched_key:
+                    debug(f"Canonical merchant from tag key: '{matched_key}' (was '{md.korrespondent}')")
+                    md.korrespondent = matched_key
+                    canonical_kor = matched_key
+                # Ensure tags from chosen mapping
+                if tag_name:
+                    tag_ids = ensure_tag_ids(args.base_url, token, [tag_name])
+                    debug(f"Selected tag '{tag_name}' -> ids={tag_ids}")
+
             # Created date
             created = created or (md.ausstellungsdatum if md else None) or md_json.get("ausstellungsdatum")
-            # Correspondent and document type
-            kor = (md.korrespondent if md else _normalize_korrespondent(str(md_json.get("korrespondent") or md_json.get("merchant") or "")).strip())
+
+            # Document type
+            doc_type = (md.dokumenttyp if md else (md_json.get("dokumenttyp") or "Kassenbon")).strip() or "Kassenbon"
+            document_type_id = ensure_document_type_id(args.base_url, token, doc_type)
+            if document_type_id:
+                debug(f"Using document type '{doc_type}' (id={document_type_id}) from metadata JSON")
+
+            # Correspondent: use canonical_kor (tag key) when available
+            kor = canonical_kor or (md.korrespondent if md else _normalize_korrespondent(str(md_json.get("korrespondent") or md_json.get("merchant") or "")).strip())
             if kor:
                 correspondent_id = ensure_correspondent_id(args.base_url, token, kor)
                 if correspondent_id:
                     debug(f"Using correspondent '{kor}' (id={correspondent_id}) from metadata JSON")
                 else:
                     debug(f"WARN: Could not resolve/create correspondent for '{kor}' from metadata JSON")
-            doc_type = (md.dokumenttyp if md else (md_json.get("dokumenttyp") or "Kassenbon")).strip() or "Kassenbon"
-            document_type_id = ensure_document_type_id(args.base_url, token, doc_type)
-            if document_type_id:
-                debug(f"Using document type '{doc_type}' (id={document_type_id}) from metadata JSON")
-            # Tags via tag_map using korrespondent
-            tag_key = kor.lower() if kor else None
-            if tag_key and isinstance(tag_map, dict):
-                tag_name = tag_map.get(tag_key)
-                if tag_name:
-                    tag_ids = ensure_tag_ids(args.base_url, token, [tag_name])
-                    debug(f"Mapped tag '{tag_name}' -> ids={tag_ids} (from metadata JSON)")
-            # Title: build from md if not explicitly provided by CLI
+
+            # Title: build from md (which now carries canonical korrespondent) if not explicitly provided by CLI
             if md is not None and not title:
                 title = md.title()
                 debug(f"Constructed title from metadata JSON: {title}")
@@ -487,19 +464,7 @@ def main():
             debug(f"WARN: Failed applying metadata JSON: {e}")
 
     elif md is not None:
-        # Ensure correspondent
-        correspondent_id = ensure_correspondent_id(args.base_url, token, md.korrespondent)
-        if correspondent_id:
-            debug(f"Using correspondent '{md.korrespondent}' (id={correspondent_id})")
-        else:
-            debug(f"WARN: Could not resolve/create correspondent for '{md.korrespondent}'.")
-
-        # Ensure document type 'Kassenbon'
-        document_type_id = ensure_document_type_id(args.base_url, token, md.dokumenttyp)
-        if document_type_id:
-            debug(f"Using document type '{md.dokumenttyp}' (id={document_type_id})")
-
-        # Choose tag using exact/substring/fuzzy on normalized keys
+        # Resolve canonical merchant via tag_map first and use it everywhere
         tag_name, matched_key = _resolve_tag_and_key(tag_map if isinstance(tag_map, dict) else {}, md.korrespondent)
         if matched_key:
             debug(f"Canonical merchant from tag key: '{matched_key}' (was '{md.korrespondent}')")
@@ -507,6 +472,17 @@ def main():
         if tag_name:
             tag_ids = ensure_tag_ids(args.base_url, token, [tag_name])
             debug(f"Selected tag '{tag_name}' -> ids={tag_ids}")
+
+        # Ensure correspondent and document type after canonicalization
+        correspondent_id = ensure_correspondent_id(args.base_url, token, md.korrespondent)
+        if correspondent_id:
+            debug(f"Using correspondent '{md.korrespondent}' (id={correspondent_id})")
+        else:
+            debug(f"WARN: Could not resolve/create correspondent for '{md.korrespondent}'.")
+
+        document_type_id = ensure_document_type_id(args.base_url, token, md.dokumenttyp)
+        if document_type_id:
+            debug(f"Using document type '{md.dokumenttyp}' (id={document_type_id})")
 
         # Title + created (no ASN)
         created = created or md.ausstellungsdatum

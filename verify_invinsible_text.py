@@ -5,8 +5,24 @@ import argparse
 import fitz  # PyMuPDF
 from typing import List, Set, Tuple, Optional
 
+# Shared logging (Phase 1)
+try:
+    from src.paperless_automation.logging import get_logger  # type: ignore
+except Exception:
+    def get_logger(name: str):  # type: ignore
+        class _L:
+            def info(self, m):
+                print(f"[{name}] {m}")
+            debug = info
+            warning = info
+            error = info
+        return _L()
+
+_LOG = get_logger("verify-v2")
+
+
 def log(msg: str) -> None:
-    print(f"[verify-v2] {msg}", flush=True)
+    _LOG.info(msg)
 
 def extract_text_sample(page: fitz.Page, max_chars=200) -> Tuple[str, str]:
     txt = page.get_text("text") or ""

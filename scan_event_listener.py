@@ -14,9 +14,25 @@ SCAN_IMAGE_CONFIG_PATH = os.path.join(SCRIPT_DIR, "scan-image-path.txt")
 WATCH_EXTS: Set[str] = {".jpg", ".jpeg", ".pdf"}
 
 
+# New shared logging (Phase 1)
+try:
+    from src.paperless_automation.logging import get_logger  # type: ignore
+except Exception:
+    def get_logger(name: str):  # type: ignore
+        class _L:
+            def info(self, m):
+                ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                print(f"[{ts}] [{name}] {m}", flush=True)
+            debug = info
+            warning = info
+            error = info
+        return _L()
+
+_LOG = get_logger("scan-event-listener")
+
+
 def debug_print(msg: str) -> None:
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] [scan-event-listener] {msg}", flush=True)
+    _LOG.info(msg)
 
 
 def read_watch_dir_from_file(config_path: Optional[str] = None) -> str:

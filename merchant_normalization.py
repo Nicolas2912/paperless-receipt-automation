@@ -2,6 +2,21 @@ from typing import Dict, List, Optional, Tuple
 import re
 import unicodedata
 
+# Shared logging (Phase 1)
+try:
+    from src.paperless_automation.logging import get_logger  # type: ignore
+except Exception:
+    def get_logger(name: str):  # type: ignore
+        class _L:
+            def info(self, m):
+                print(f"[{name}] {m}")
+            debug = info
+            warning = info
+            error = info
+        return _L()
+
+_LOG = get_logger("merchant-normalization")
+
 
 def _only_letters_and_spaces(s: str) -> str:
     """Keep only Unicode letters and spaces, preserving German umlauts.
@@ -66,14 +81,12 @@ def normalize_korrespondent(name: str) -> str:
 
     # Verbose debug prints for diagnostics
     try:
-        print(
-            "[normalize_korrespondent] raw=\"{}\" | nfc=\"{}\" | lowered=\"{}\" | letters_only=\"{}\" | cleaned=\"{}\"".format(
+        _LOG.info(
+            "raw=\"{}\" | nfc=\"{}\" | lowered=\"{}\" | letters_only=\"{}\" | cleaned=\"{}\"".format(
                 raw_input, nfc, lowered, letters_spaces, cleaned
-            ),
-            flush=True,
+            )
         )
     except Exception:
-        # Avoid any logging failures impacting the pipeline
         pass
 
     return cleaned

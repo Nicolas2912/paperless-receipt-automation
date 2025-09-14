@@ -2,9 +2,24 @@ import os
 import re
 from typing import Tuple, Iterable
 
+# Shared logging (Phase 1)
+try:
+    from src.paperless_automation.logging import get_logger  # type: ignore
+except Exception:
+    def get_logger(name: str):  # type: ignore
+        class _L:
+            def info(self, m):
+                print(f"[{name}] {m}", flush=True)
+            debug = info
+            warning = info
+            error = info
+        return _L()
+
+_LOG = get_logger("rename-docs")
+
 
 def _log(msg: str) -> None:
-    print(f"[rename-docs] {msg}", flush=True)
+    _LOG.info(msg)
 
 
 INVALID_WIN_CHARS = r'<>:"/\\|?*'

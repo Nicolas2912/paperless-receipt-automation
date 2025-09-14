@@ -36,9 +36,27 @@ from typing import Optional, Dict, Any
 import requests
 import re
 
+# Shared logging & paths (Phase 1)
+try:
+    from src.paperless_automation.logging import get_logger  # type: ignore
+    from src.paperless_automation.paths import fix_windows_path_input as _fix_input  # type: ignore
+except Exception:
+    def get_logger(name: str):  # type: ignore
+        class _L:
+            def info(self, m):
+                print(f"[{name}] {m}")
+            debug = info
+            warning = info
+            error = info
+        return _L()
+    def _fix_input(p: str) -> str:  # type: ignore
+        return p
+
+_LOG = get_logger("metadata")
+
 
 def debug(msg: str) -> None:
-    print(f"[metadata] {msg}", flush=True)
+    _LOG.info(msg)
 
 
 DEFAULT_OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")

@@ -6,9 +6,24 @@ from typing import Optional, Dict, Any, List, Tuple
 
 import requests as _rq
 
+# New shared logging (Phase 1)
+try:
+    from src.paperless_automation.logging import get_logger  # type: ignore
+except Exception:
+    def get_logger(name: str):  # type: ignore
+        class _L:
+            def info(self, m):
+                print(f"[{name}] {m}", flush=True)
+            debug = info
+            warning = info
+            error = info
+        return _L()
+
+_LOG = get_logger("processed-index")
+
 
 def debug(msg: str) -> None:
-    print(f"[processed-index] {msg}", flush=True)
+    _LOG.info(msg)
 
 
 DB_FILENAME = "paperless.sqlite3"

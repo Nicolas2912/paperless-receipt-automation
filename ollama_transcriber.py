@@ -5,10 +5,27 @@ import json
 import os
 import re
 
-# Provide a fallback debug_print so importing this module does not require
-# scan_event_listener. main() will try to import the real one.
+# Shared logging & paths (Phase 1)
+try:
+    from src.paperless_automation.logging import get_logger  # type: ignore
+    from src.paperless_automation.paths import fix_windows_path_input as _fix_input  # type: ignore
+except Exception:
+    def get_logger(name: str):  # type: ignore
+        class _L:
+            def info(self, m):
+                print(f"[{name}] {m}")
+            debug = info
+            warning = info
+            error = info
+        return _L()
+    def _fix_input(p: str) -> str:  # type: ignore
+        return p
+
+_LOG = get_logger("ollama-transcriber")
+
+
 def debug_print(msg: str) -> None:
-    print(f"[ollama-transcriber] {msg}")
+    _LOG.info(msg)
 
 
 MODEL_NAME = "qwen2.5vl-receipt:latest"
@@ -17,7 +34,7 @@ INSTRUCTION = "Transcribe this receipt EXACTLY (spacing, order). Output plain te
 
 
 def encode_image(path: str) -> str:
-    p = _fix_windows_path_input(path)
+    p = _fix_input(path)
     if not os.path.isabs(p):
         p = os.path.abspath(p)
     if not os.path.isfile(p):
@@ -32,21 +49,8 @@ def encode_image(path: str) -> str:
 
 
 def _fix_windows_path_input(p: str) -> str:
-    """Repair common Windows path paste issues like "C:Users...".
-
-    - Inserts a backslash after drive letter if missing.
-    - Trims surrounding quotes/spaces.
-    """
-    try:
-        s = (p or "").strip().strip('"').strip("'")
-        if os.name == "nt" and re.match(r"^[A-Za-z]:(?![\\/])", s):
-            fixed = s[:2] + "\\" + s[2:]
-            if fixed != s:
-                debug_print(f"Repaired Windows path input: '{s}' -> '{fixed}'")
-            s = fixed
-        return s
-    except Exception:
-        return p
+    # Backwards compatibility: delegate to centralized helper
+    return _fix_input(p)
 
 
 def transcribe_image_via_ollama(
@@ -64,7 +68,7 @@ def transcribe_image_via_ollama(
     debug_print(f"Preparing Ollama request to {ollama_url} with model '{model}'")
     # Normalize URL to /api/chat
     url = ollama_url if ollama_url.endswith("/api/chat") else ollama_url.rstrip("/") + "/api/chat"
-    img_path = _fix_windows_path_input(image_path)
+    img_path = _fix_input(image_path)
     img_b64 = encode_image(img_path)
     payload = {
         "model": model,
