@@ -54,6 +54,16 @@ except Exception:
 
 _LOG = get_logger("metadata")
 
+# Shared normalization (Phase 2)
+try:
+    from src.paperless_automation.domain.normalize import (
+        normalize_date_iso as _normalize_date_iso_shared,
+        normalize_amount as _normalize_amount_shared,
+    )
+except Exception:
+    _normalize_date_iso_shared = None  # type: ignore
+    _normalize_amount_shared = None  # type: ignore
+
 
 def debug(msg: str) -> None:
     _LOG.info(msg)
@@ -79,7 +89,7 @@ class PDFMetadataExtractor:
       checking for the standalone token "REWE".
     - ausstellungsdatum: find the label "Rechnungsdatum" and parse the nearest
       date (same line or next line). Output as YYYY-MM-DD.
-    - betrag_value: find the label "Summe" and parse the nearest amount
+    - betrag_value: find the label "Summe" or "ZU ZAHLEN" and parse the nearest amount
       (same line or next line). Normalize to dot decimal with two places.
     - betrag_currency: always "EUR".
     - dokumenttyp: always "Rechnung".
@@ -207,12 +217,25 @@ class PDFMetadataExtractor:
             betrag_currency=cur,
             dokumenttyp=dtype,
         )
-        debug(
-            "[pdf] Extracted: korrespondent='{}', date={}, amount={} {} type={}".format(
-                md.korrespondent, md.ausstellungsdatum, md.betrag_value, md.betrag_currency, md.dokumenttyp
-            )
-        )
-        debug(f"[pdf] Generated base title: {md.title()}")
+        # Structured summary for PDF route (no LLM involved)
+        _LOG.info("[pdf] === Extracted metadata summary (PDF route) ===")
+        _LOG.info(f"[pdf] korrespondent     : {md.korrespondent}")
+        _LOG.info(f"[pdf] ausstellungsdatum: {md.ausstellungsdatum}")
+        _LOG.info(f"[pdf] betrag_value     : {md.betrag_value}")
+        _LOG.info(f"[pdf] betrag_currency  : {md.betrag_currency}")
+        _LOG.info(f"[pdf] dokumenttyp      : {md.dokumenttyp}")
+        _LOG.info(f"[pdf] title (preview)  : {md.title()}")
+        if md.ausstellungsdatum == "1970-01-01":
+            _LOG.warning("[pdf] ausstellungsdatum fallback in use (1970-01-01)")
+        if md.betrag_value == "0.00":
+            _LOG.warning("[pdf] betrag_value fallback in use (0.00)")
+        try:
+            pretty = json.dumps(asdict(md) | {"title": md.title()}, ensure_ascii=False, indent=2)
+            for line in pretty.splitlines():
+                _LOG.debug(f"[pdf] json {line}")
+        except Exception:
+            pass
+        _LOG.info("[pdf] ==============================================")
         return md
 
 
@@ -332,6 +355,10 @@ def _ollama_chat_vision(image_path: str, model: str, ollama_url: str, timeout: i
 
     # Ollama returns a dict with 'message': {'content': '...'}
     content = (data or {}).get("message", {}).get("content", "").strip()
+    if content:
+        # Helpful preview for debugging when JSON parsing fails downstream
+        preview = content.replace("\n", " ")[:300]
+        _LOG.debug(f"[llm] Raw content preview (first 300 chars): {preview}")
     if not content:
         debug("ERROR: Empty content from Ollama")
         return None
@@ -345,6 +372,7 @@ def _ollama_chat_vision(image_path: str, model: str, ollama_url: str, timeout: i
         if not isinstance(obj, dict):
             debug("ERROR: LLM did not return a JSON object.")
             return None
+        _LOG.debug(f"[llm] Parsed JSON keys: {sorted(list(obj.keys()))}")
         return obj
     except Exception as e:
         debug(f"ERROR parsing LLM JSON: {e}; content preview: {content[:200]}")
@@ -352,6 +380,8 @@ def _ollama_chat_vision(image_path: str, model: str, ollama_url: str, timeout: i
 
 
 def _normalize_date_iso(value: str) -> Optional[str]:
+    if _normalize_date_iso_shared is not None:
+        return _normalize_date_iso_shared(value)  # delegate to shared
     if not value:
         return None
     v = value.strip()
@@ -369,6 +399,8 @@ def _normalize_date_iso(value: str) -> Optional[str]:
 
 
 def _normalize_amount(val: Any) -> Optional[str]:
+    if _normalize_amount_shared is not None:
+        return _normalize_amount_shared(val)  # delegate to shared
     """Normalize various decimal/thousands notations to dot-decimal string with two decimals.
 
     Handles inputs like '14,70', '14.70', '1.470,00', '1,470.00', and raw numbers.
@@ -451,6 +483,71 @@ class ExtractedMetadata:
 
 
 
+def _log_llm_metadata_summary(md: "ExtractedMetadata", obj: Dict[str, Any], *, source: str | None = None, model: str | None = None) -> None:
+    """Log a clear, structured summary for LLM-extracted metadata.
+
+    - Shows normalized values and how they differ from the raw LLM output.
+    - Warns when fallbacks/defaults are used (e.g., date 1970-01-01, amount 0.00).
+    - Uses the shared logger for consistent console output.
+    """
+    raw_k = str(obj.get("korrespondent", "")).strip()
+    raw_d = str(obj.get("ausstellungsdatum", "")).strip()
+    raw_v = obj.get("betrag_value")
+    raw_c = str(obj.get("betrag_currency", "")).strip()
+
+    # Normalization diffs (string compare; case-insensitive for korrespondent)
+    diffs: list[str] = []
+    if raw_k and (raw_k.strip().lower() != (md.korrespondent or "").strip().lower()):
+        diffs.append(f"korrespondent: '{raw_k}' -> '{md.korrespondent}'")
+    if raw_d and raw_d != md.ausstellungsdatum:
+        diffs.append(f"ausstellungsdatum: '{raw_d}' -> '{md.ausstellungsdatum}'")
+    raw_v_str = None if raw_v is None else str(raw_v)
+    if raw_v_str and raw_v_str != md.betrag_value:
+        diffs.append(f"betrag_value: '{raw_v_str}' -> '{md.betrag_value}'")
+    if raw_c and raw_c.upper() != (md.betrag_currency or "").upper():
+        diffs.append(f"betrag_currency: '{raw_c}' -> '{md.betrag_currency}'")
+
+    # Fallback warnings
+    if md.ausstellungsdatum == "1970-01-01":
+        _LOG.warning("[llm] ausstellungsdatum fallback in use (1970-01-01)")
+    if md.betrag_value == "0.00":
+        _LOG.warning("[llm] betrag_value fallback in use (0.00)")
+    if not md.korrespondent:
+        _LOG.warning("[llm] korrespondent empty after normalization")
+
+    header_bits = []
+    if source:
+        header_bits.append(f"source={os.path.basename(source)}")
+    if model:
+        header_bits.append(f"model={model}")
+    header = ", ".join(header_bits) if header_bits else "LLM metadata"
+
+    # Main structured summary
+    _LOG.info("[llm] === Extracted metadata summary ({}) ===".format(header))
+    _LOG.info(f"[llm] korrespondent     : {md.korrespondent}")
+    _LOG.info(f"[llm] ausstellungsdatum: {md.ausstellungsdatum}")
+    _LOG.info(f"[llm] betrag_value     : {md.betrag_value}")
+    _LOG.info(f"[llm] betrag_currency  : {md.betrag_currency}")
+    _LOG.info(f"[llm] dokumenttyp      : {md.dokumenttyp}")
+    _LOG.info(f"[llm] title (preview)  : {md.title()}")
+
+    if diffs:
+        _LOG.info("[llm] Normalization changes:")
+        for d in diffs:
+            _LOG.info(f"[llm]  - {d}")
+    else:
+        _LOG.debug("[llm] No normalization changes detected")
+
+    # Pretty JSON for quick inspection at DEBUG level
+    try:
+        pretty = json.dumps(asdict(md) | {"title": md.title()}, ensure_ascii=False, indent=2)
+        for line in pretty.splitlines():
+            _LOG.debug(f"[llm] json {line}")
+    except Exception:
+        pass
+
+    _LOG.info("[llm] ===============================================")
+
 
 def extract_from_source(
     source_path: str,
@@ -486,12 +583,7 @@ def extract_from_source(
         betrag_value=amt,
         betrag_currency=cur,
     )
-    debug(
-        "[llm] Extracted: korrespondent='{}', date={}, amount={} {}".format(
-            md.korrespondent, md.ausstellungsdatum, md.betrag_value, md.betrag_currency
-        )
-    )
-    debug(f"[llm] Generated base title: {md.title()}")
+    _log_llm_metadata_summary(md, obj, source=source_path, model=model)
     return md
 
 

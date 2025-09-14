@@ -8,6 +8,14 @@ For understanding my project read the readme and diagrams.md and the corespondin
 
 When writing git commit message read and do the following: 
 
+Make the git commit message always with proper format! Write the git commit message first into a temporarly txt file and then copy this message back to the command line.
+Never include literal \n.
+Subject: <type>(<scope>): <imperative summary> ≤ 72 chars.
+Wrap body at around 72 chars.
+Body answers what changed and why.
+Use bullets for lists.
+If risks/breaking changes exist, add a section and a BREAKING CHANGE: footer.
+No code fences, no markdown other than bullets.
 - 
 
 Role

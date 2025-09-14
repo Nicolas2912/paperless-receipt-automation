@@ -231,6 +231,15 @@ def _detect_currency(text: str) -> str:
     return "EUR"
 
 
+try:
+    from src.paperless_automation.domain.normalize import (
+        detect_currency as _shared_detect_currency,
+    )
+    _detect_currency = _shared_detect_currency  # type: ignore
+except Exception:
+    pass
+
+
 def _guess_merchant(text: str) -> str:
     # Use first non-empty line that doesn't look like generic words
     lines = [ln.strip() for ln in re.split(r"[\r\n]+", text) if ln.strip()]
@@ -250,12 +259,40 @@ def extract_metadata_from_text(text: str) -> Optional[ExtractedMetadata]:
     currency = _detect_currency(text)
     merchant = _normalize_korrespondent(_guess_merchant(text))
     try:
-        return ExtractedMetadata(
+        md = ExtractedMetadata(
             korrespondent=merchant,
             ausstellungsdatum=date_iso,
             betrag_value=amount,
             betrag_currency=currency,
         )
+        # Structured summary for text-based extraction path
+        _LOG.info("[text] === Extracted metadata summary (transcript heuristics) ===")
+        _LOG.info(f"[text] korrespondent     : {md.korrespondent}")
+        _LOG.info(f"[text] ausstellungsdatum: {md.ausstellungsdatum}")
+        _LOG.info(f"[text] betrag_value     : {md.betrag_value}")
+        _LOG.info(f"[text] betrag_currency  : {md.betrag_currency}")
+        _LOG.info(f"[text] dokumenttyp      : {md.dokumenttyp}")
+        _LOG.info(f"[text] title (preview)  : {md.title()}")
+        if md.ausstellungsdatum == "1970-01-01":
+            _LOG.warning("[text] ausstellungsdatum fallback in use (1970-01-01)")
+        if md.betrag_value == "0.00":
+            _LOG.warning("[text] betrag_value fallback in use (0.00)")
+        try:
+            import json as _json
+            pretty = _json.dumps({
+                "korrespondent": md.korrespondent,
+                "ausstellungsdatum": md.ausstellungsdatum,
+                "betrag_value": md.betrag_value,
+                "betrag_currency": md.betrag_currency,
+                "dokumenttyp": md.dokumenttyp,
+                "title": md.title(),
+            }, ensure_ascii=False, indent=2)
+            for line in pretty.splitlines():
+                _LOG.debug(f"[text] json {line}")
+        except Exception:
+            pass
+        _LOG.info("[text] =====================================================")
+        return md
     except Exception:
         return None
 
