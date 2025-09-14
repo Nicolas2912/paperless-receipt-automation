@@ -89,8 +89,8 @@ class PDFMetadataExtractor:
       checking for the standalone token "REWE".
     - ausstellungsdatum: find the label "Rechnungsdatum" and parse the nearest
       date (same line or next line). Output as YYYY-MM-DD.
-    - betrag_value: find the label "Summe" or "ZU ZAHLEN" and parse the nearest amount
-      (same line or next line). Normalize to dot decimal with two places.
+    - betrag_value: find the label "Summe" or "ZU ZAHLEN" which is usually on the bottom or middle of the receipt and never on the top and parse the nearest amount. 
+      The correct amount is usually the biggest value with the highest value so find it. Normalize to dot decimal with two places.
     - betrag_currency: always "EUR".
     - dokumenttyp: always "Rechnung".
 

@@ -89,66 +89,40 @@ def _auth_headers(token: str) -> Dict[str, str]:
     return {"Authorization": f"Token {token}", "Accept": "application/json"}
 
 def _api_patch_document(base_url: str, token: str, doc_id: int, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    url = f"{base_url.rstrip('/')}/api/documents/{doc_id}/"
     try:
-        r = requests.patch(
-            url,
-            headers=_auth_headers(token) | {"Content-Type": "application/json"},
-            json=payload,
-            timeout=30,
-        )
-        r.raise_for_status()
-        return r.json()
+        from src.paperless_automation.paperless.client import PaperlessClient  # type: ignore
+        client = PaperlessClient(base_url, token)
+        return client.patch_document(doc_id, payload)
     except Exception as e:
         debug(f"ERROR patching document {doc_id}: {e}")
-        try:
-            if 'r' in locals() and hasattr(r, 'text'):
-                preview = r.text
-                preview = (preview[:500] + "...") if len(preview) > 500 else preview
-                debug(f"PATCH response body preview: {preview}")
-        except Exception:
-            pass
         return None
 
 
 def _api_find_task_by_uuid(base_url: str, token: str, task_uuid: str) -> Optional[Dict[str, Any]]:
-    base = base_url.rstrip("/")
-    url = f"{base}/api/tasks/?task_id={requests.utils.quote(task_uuid)}&page_size=1"
     try:
-        r = requests.get(url, headers=_auth_headers(token), timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        results = data.get("results") if isinstance(data, dict) else None
-        if results and isinstance(results, list) and isinstance(results[0], dict):
-            return results[0]
+        from src.paperless_automation.paperless.client import PaperlessClient  # type: ignore
+        client = PaperlessClient(base_url, token)
+        return client.find_task_by_uuid(task_uuid)
     except Exception as e:
         debug(f"WARN: Failed to find task by UUID: {e}")
-    return None
+        return None
 
 
 def _api_find_document_by_title(base_url: str, token: str, title: str) -> Optional[int]:
-    base = base_url.rstrip("/")
-    url = f"{base}/api/documents/?title__iexact={requests.utils.quote(title)}&ordering=-id&page_size=1"
     try:
-        r = requests.get(url, headers=_auth_headers(token), timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        results = data.get("results") if isinstance(data, dict) else None
-        if results and isinstance(results, list) and isinstance(results[0], dict):
-            did = results[0].get("id")
-            if isinstance(did, int):
-                return did
+        from src.paperless_automation.paperless.client import PaperlessClient  # type: ignore
+        client = PaperlessClient(base_url, token)
+        return client.find_document_by_title(title)
     except Exception as e:
         debug(f"WARN: Could not search document by title: {e}")
-    return None
+        return None
 
 
 def _api_get_document(base_url: str, token: str, doc_id: int) -> Optional[Dict[str, Any]]:
-    url = f"{base_url.rstrip('/')}/api/documents/{doc_id}/"
     try:
-        r = requests.get(url, headers=_auth_headers(token), timeout=20)
-        r.raise_for_status()
-        return r.json()
+        from src.paperless_automation.paperless.client import PaperlessClient  # type: ignore
+        client = PaperlessClient(base_url, token)
+        return client.get_document(doc_id)
     except Exception as e:
         debug(f"WARN: Failed to GET document {doc_id}: {e}")
         return None
@@ -158,19 +132,21 @@ def _api_get_document(base_url: str, token: str, doc_id: int) -> Optional[Dict[s
 
 
 def _api_get_first_by_name(base_url: str, token: str, resource: str, name: str) -> Optional[Dict[str, Any]]:
-    # Try iexact first, then fallback to icontains
-    base = base_url.rstrip("/")
-    for param in (f"name__iexact={requests.utils.quote(name)}", f"name__icontains={requests.utils.quote(name)}"):
-        url = f"{base}/api/{resource}/?{param}&page_size=1"
-        try:
-            r = requests.get(url, headers=_auth_headers(token), timeout=30)
-            r.raise_for_status()
-            data = r.json()
-            results = data.get("results") if isinstance(data, dict) else None
-            if results:
-                return results[0]
-        except Exception:
-            continue
+    # Kept for backward compatibility; now routes through client ensure calls
+    try:
+        from src.paperless_automation.paperless.client import PaperlessClient  # type: ignore
+        client = PaperlessClient(base_url, token)
+        if resource == "correspondents":
+            cid = client.ensure_correspondent(name)
+            return {"id": cid} if isinstance(cid, int) else None
+        if resource == "document_types":
+            did = client.ensure_document_type(name)
+            return {"id": did} if isinstance(did, int) else None
+        if resource == "tags":
+            ids = client.ensure_tags([name])
+            return {"id": ids[0]} if ids else None
+    except Exception:
+        pass
     return None
 
 
@@ -187,36 +163,30 @@ def _api_create_resource(base_url: str, token: str, resource: str, payload: Dict
 
 
 def ensure_correspondent_id(base_url: str, token: str, name: str) -> Optional[int]:
-    if not name:
+    try:
+        from src.paperless_automation.paperless.client import PaperlessClient  # type: ignore
+        client = PaperlessClient(base_url, token)
+        return client.ensure_correspondent(name)
+    except Exception:
         return None
-    found = _api_get_first_by_name(base_url, token, "correspondents", name)
-    if found:
-        return found.get("id")
-    created = _api_create_resource(base_url, token, "correspondents", {"name": name})
-    return created.get("id") if created else None
 
 
 def ensure_tag_ids(base_url: str, token: str, names: List[str]) -> List[int]:
-    ids: List[int] = []
-    for name in names:
-        if not name:
-            continue
-        found = _api_get_first_by_name(base_url, token, "tags", name)
-        if found:
-            ids.append(found.get("id"))
-            continue
-        created = _api_create_resource(base_url, token, "tags", {"name": name})
-        if created and "id" in created:
-            ids.append(created["id"])
-    return [i for i in ids if isinstance(i, int)]
+    try:
+        from src.paperless_automation.paperless.client import PaperlessClient  # type: ignore
+        client = PaperlessClient(base_url, token)
+        return client.ensure_tags(names)
+    except Exception:
+        return []
 
 
 def ensure_document_type_id(base_url: str, token: str, name: str) -> Optional[int]:
-    found = _api_get_first_by_name(base_url, token, "document_types", name)
-    if found:
-        return found.get("id")
-    created = _api_create_resource(base_url, token, "document_types", {"name": name})
-    return created.get("id") if created else None
+    try:
+        from src.paperless_automation.paperless.client import PaperlessClient  # type: ignore
+        client = PaperlessClient(base_url, token)
+        return client.ensure_document_type(name)
+    except Exception:
+        return None
 
 
 """Serial number logic removed by request."""
@@ -241,89 +211,30 @@ def upload_document(
     if not token:
         raise ValueError("API token missing. Provide --token or set PAPERLESS_TOKEN.")
 
-    endpoint = build_endpoint(base_url)
     size = os.path.getsize(file_path)
     mime = guess_mime(file_path)
-
-    debug(f"Target: {endpoint}")
+    debug(f"Target: {build_endpoint(base_url)}")
     debug(f"File: {file_path} ({size} bytes, mime={mime})")
     debug(f"Title: {title!r}, Created: {created!r}")
-    debug("Sending request...")
+    debug("Sending request via PaperlessClient...")
 
-    headers = _auth_headers(token)
-    # Use a list of tuples to allow repeated 'tags' fields
-    data_list: List[Tuple[str, str]] = []
-    if title:
-        data_list.append(("title", title))
-    if created:
-        data_list.append(("created", created))
-    if correspondent_id is not None:
-        data_list.append(("correspondent", str(correspondent_id)))
-    if document_type_id is not None:
-        data_list.append(("document_type", str(document_type_id)))
-    if tag_ids:
-        for tid in tag_ids:
-            data_list.append(("tags", str(tid)))
-    # Extra serial numbering is not supported.
-
-    with open(file_path, "rb") as f:
-        files = {"document": (os.path.basename(file_path), f, mime)}
-        try:
-            resp = requests.post(
-                endpoint, headers=headers, data=data_list, files=files,
-                timeout=timeout, verify=verify_tls
-            )
-        except requests.RequestException as e:
-            debug(f"HTTP error while uploading: {e}")
-            raise
-
-    debug(f"HTTP {resp.status_code}")
-    ct = resp.headers.get("Content-Type", "")
-    text = resp.text
-
-    # Try JSON first if Content-Type hints at JSON, otherwise heuristically.
-    is_json_ct = "json" in ct.lower()
-    payload = None
-    if is_json_ct:
-        try:
-            payload = resp.json()
-        except Exception as e:
-            debug(f"JSON parse failed despite JSON Content-Type: {e}; falling back to text.")
-
-    if payload is None and text:
-        t = text.lstrip()
-        if t[:1] in ("{", "[", '"'):
-            try:
-                payload = json.loads(text)
-                debug("Parsed JSON from response body by heuristic.")
-            except Exception as e:
-                debug(f"Heuristic JSON parse failed: {e}")
-
-    if payload is not None:
-        # Log payload shape without assuming dict
-        if isinstance(payload, dict):
-            debug(f"Response JSON keys: {list(payload.keys())}")
-        elif isinstance(payload, list):
-            debug(f"Response JSON is a list with {len(payload)} items")
-        else:
-            preview = str(payload)
-            preview = (preview[:200] + "...") if len(preview) > 200 else preview
-            debug(f"Response JSON type={type(payload).__name__}; preview: {preview}")
-
-        if resp.ok or resp.status_code in (200, 201, 202, 204):
-            debug("Upload accepted by Paperless-NGX.")
-        else:
-            debug(f"Upload not OK (status {resp.status_code}); returning payload for inspection.")
-        return {"status_code": resp.status_code, "json": payload}
-
-    # Non-JSON path
-    if resp.ok:
-        debug("Non-JSON response with HTTP OK; returning raw text for inspection.")
-        return {"status_code": resp.status_code, "raw": text}
-    else:
-        debug("Non-JSON response and not OK; raising for status.")
-        resp.raise_for_status()
-        return {"status_code": resp.status_code, "raw": text}
+    try:
+        from src.paperless_automation.paperless.client import PaperlessClient  # type: ignore
+        client = PaperlessClient(base_url, token, timeout=timeout, verify_tls=verify_tls)
+        res = client.post_document(
+            file_path=file_path,
+            title=title,
+            created=created,
+            correspondent_id=correspondent_id,
+            tag_ids=tag_ids,
+            document_type_id=document_type_id,
+        )
+        status = int(res.get("status_code", 0))
+        debug(f"HTTP {status}")
+        return {"status_code": status, "json": res.get("json")}
+    except Exception as e:
+        debug(f"HTTP error while uploading: {e}")
+        raise
 
 
 def main():
