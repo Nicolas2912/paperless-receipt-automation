@@ -149,3 +149,37 @@ def rename_with_metadata(
         raise
 
     return new_image, new_pdf
+
+
+def rename_pdf_only(
+    pdf_path: str,
+    *,
+    date_iso: str,
+    korrespondent: str,
+) -> str:
+    """Rename a standalone PDF to `<date>_<kor>_<id>.pdf`.
+
+    - Uses the same shared id strategy as `rename_with_metadata` so numbering
+      is consistent with any existing images/PDFs in the same folder.
+    - Returns the new absolute PDF path.
+    """
+    pdf_dir = os.path.abspath(os.path.dirname(pdf_path))
+    kor_safe = sanitize_component(korrespondent)
+
+    # Reuse `_next_shared_id` logic; pass the PDF folder as both image/pdf dir
+    # and `.pdf` as the image_ext seed so it scans JPEG variants + PDF.
+    sid = _next_shared_id(pdf_dir, pdf_dir, date_iso, kor_safe, ".pdf")
+    base = f"{date_iso}_{kor_safe}_{sid}"
+    new_pdf = os.path.join(pdf_dir, base + ".pdf")
+
+    _log(f"Computed shared id={sid} for date={date_iso}, korrespondent={korrespondent!r} (PDF-only)")
+    _log(f"Renaming pdf   -> {new_pdf}")
+
+    try:
+        if os.path.abspath(pdf_path) != os.path.abspath(new_pdf):
+            os.replace(pdf_path, new_pdf)
+    except Exception as e:
+        _log(f"ERROR renaming PDF: {e}")
+        raise
+
+    return new_pdf
