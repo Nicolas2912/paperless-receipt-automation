@@ -496,6 +496,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from src.paperless_automation.cli.main import main as cli_main
 
-
+    cli_main(["upload", *sys.argv[1:]])

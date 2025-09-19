@@ -267,8 +267,6 @@ def main_scaneventlistener() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        debug_print(f"FATAL: Unhandled exception: {e}")
-        sys.exit(1)
+    from src.paperless_automation.cli.main import main as cli_main
+
+    cli_main(["scan-listener", *sys.argv[1:]])

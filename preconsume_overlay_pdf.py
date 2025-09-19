@@ -421,4 +421,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from src.paperless_automation.cli.main import main as cli_main
+
+    forwarded = list(sys.argv[1:])
+    if (
+        len(forwarded) >= 2
+        and forwarded[0] == "--mode"
+        and forwarded[1] in {"cli", "watch", "preconsume"}
+    ):
+        forwarded = [forwarded[1]] + forwarded[2:]
+    cli_main(["overlay", *forwarded])

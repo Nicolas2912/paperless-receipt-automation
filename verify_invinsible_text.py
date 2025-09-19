@@ -167,4 +167,6 @@ def main():
     sys.exit(verify_pdf(args.pdf, page_idx))
 
 if __name__ == "__main__":
-    main()
+    from src.paperless_automation.cli.main import main as cli_main
+
+    cli_main(["verify", *sys.argv[1:]])

@@ -171,4 +171,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    from src.paperless_automation.cli.main import main as cli_main
+
+    cli_main(["transcribe", *sys.argv[1:]])
