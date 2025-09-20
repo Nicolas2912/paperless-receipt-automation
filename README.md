@@ -1,26 +1,22 @@
 # Paperless Receipt Automation (Windows)
 
-End-to-end automation to turn raw scan images (receipts) into searchable
-PDFs and upload them to Paperless‑ngx with sensible metadata. Optimized for
-Windows 11 + Conda, with detailed debug prints throughout.
+Automates turning scanned receipts into searchable PDFs and uploads them to Paperless‑ngx with sensible metadata. Optimized for Windows 11 + Conda. Includes a robust watcher, invisible-text PDF overlay, metadata extraction, and a processed index to avoid duplicates.
 
 Highlights:
-- Watches a scans folder for new JPEGs and processes them automatically.
-- Transcribes the receipt with a local Ollama vision model (configurable).
-- Creates a PDF with an invisible text layer (render_mode=3) via PyMuPDF.
-- Extracts structured metadata (date, merchant, amount) to build the title.
-- Ensures correspondent, document type, and mapped tags in Paperless‑ngx.
+- Watches a scans folder for new JPG/JPEG/PDF and processes automatically.
+- Transcribes images via a local Ollama vision model (configurable).
+- Creates PDFs with an invisible text layer (PyMuPDF render_mode=3).
+- Extracts metadata (date, merchant, amount) to build the title and map tags.
+- Ensures correspondent, document type, and tags in Paperless‑ngx.
 
 See diagrams.md for architecture flowcharts and sequence diagrams.
 
 ## Requirements
 
 - Windows 11
-- Conda environment named `paperless` (already created on your machine)
-- Python packages installed into that env:
-  - `pymupdf` (imported as `fitz`)
-  - `requests`
-- A reachable Paperless‑ngx instance and API token
+- Conda environment named `paperless`
+- Install dependencies via requirements.txt
+- Paperless‑ngx instance + API token
 - Optional: Local Ollama with a vision model (default: `qwen2.5vl-receipt:latest`)
 
 ## Installation
@@ -34,23 +30,23 @@ conda activate paperless
 2) Install Python dependencies into the env
 
 ```powershell
-python -m pip install --upgrade pip
-pip install pymupdf requests
+python -m pip install -r requirements.txt
 ```
 
 ## Configuration
 
-- `.env` (next to the scripts):
+- `.env` in the repo root (or an ancestor of your CWD):
 
   ```env
   PAPERLESS_TOKEN=your_paperless_api_token_here
   PAPERLESS_BASE_URL=http://localhost:8000
   OLLAMA_URL=http://localhost:11434
   OLLAMA_MODEL=qwen2.5vl-receipt:latest
+  LOG_LEVEL=INFO
+  # LOG_FILE=run.log
   ```
 
-- `scan-image-path.txt` (next to the scripts): first non-empty, non-comment line
-  must point to your scans folder. Examples:
+- `scan-image-path.txt`: first non-empty, non-comment line must point to your scans folder. Examples:
 
   ```text
   C:\\Users\\<you>\\Scans\\Images
@@ -61,10 +57,9 @@ pip install pymupdf requests
 
   Notes:
   - Quotes and environment variables are supported and expanded.
-  - On Windows, common paste mistakes like `C:Users...` are auto-repaired.
+  - Windows paste mistakes like `C:Users...` are auto-repaired.
 
-- `tag_map.json` (optional): map a lowercase merchant name to a single tag
-  name to enforce on upload, e.g.:
+- `tag_map.json` (optional): map a normalized merchant to a single tag name to enforce on upload, e.g.:
 
   ```json
   {
@@ -74,9 +69,9 @@ pip install pymupdf requests
   }
   ```
 
-## Main Usage
+## Usage (Unified CLI)
 
-All entry points now live under `src/paperless_automation`. Use the unified CLI:
+All entry points live under `src/paperless_automation`. Use:
 
 - Watch mode (continuous):
 
@@ -84,13 +79,13 @@ All entry points now live under `src/paperless_automation`. Use the unified CLI:
   python -m paperless_automation watch --base-url http://<host>:<port>
   ```
 
-- Single-file mode (one image):
+- Single-file mode (image or PDF):
 
   ```powershell
-  python -m paperless_automation single --source "C:\path\to\image.jpg" --base-url http://<host>:<port>
+  python -m paperless_automation single --source "C:\path\to\file.jpg" --base-url http://<host>:<port>
   ```
 
-- Equivalent, explicit form with the flow command:
+- Explicit flow command (equivalent to the aliases above):
 
   ```powershell
   python -m paperless_automation flow --mode watch
@@ -103,62 +98,60 @@ Useful flags / env vars:
 - `--output-dir` (default `var/generated_pdfs` under the repo root)
 - `--ollama-url` or `OLLAMA_URL` (default `http://localhost:11434`)
 - `--ollama-model` or `OLLAMA_MODEL` (default `qwen2.5vl-receipt:latest`)
-- `--insecure` to skip TLS verification when using HTTPS test setups
+- `--insecure` to skip TLS verification for Paperless calls
+- `--timeout` for Paperless HTTP requests (default 60s)
 
-Processing steps (watch mode):
-1) Detect new files via `paperless_automation.orchestrator.watch.ScanEventListener`.
-2) Transcribe via Ollama (`paperless_automation.orchestrator.transcribe`).
-3) Create a searchable PDF with invisible text (`paperless_automation.orchestrator.overlay`).
-4) Extract metadata (heuristics + registry; includes LLM for images).
-5) Rename image + PDF to `YYYY-MM-DD_<Merchant>_<id>.*` (`paperless_automation.orchestrator.rename`).
-6) Upload to Paperless‑ngx (`paperless_automation.orchestrator.upload`) and enforce mapped tags.
+Additional utilities:
+- Verify overlay: `python -m paperless_automation verify --pdf C:\path\to\file.pdf [--page 1]`
+- Transcribe: `python -m paperless_automation transcribe --source C:\path\to\image.jpg --ollama-url http://localhost:11434 --ollama-model qwen2.5vl-receipt:latest`
+- Extract metadata: `python -m paperless_automation extract --source C:\path\to\file.pdf`
+- Overlay tools:
+  - `overlay cli`: `python -m paperless_automation overlay cli --image <in> --output <out> [--text "..."] [--ollama-url ... --ollama-model ...]`
+  - `overlay watch`: `python -m paperless_automation overlay watch --output-dir <dir> [--watch-dir <dir>] [--ollama-url ... --ollama-model ...]`
+  - `overlay preconsume`: run inside Paperless pre-consume hook using `DOCUMENT_WORKING_PATH`
+- Standalone watcher (prints new files): `python -m paperless_automation scan-listener`
 
-## Script Tooling
+## How It Works
 
-- Watcher: `paperless_automation.orchestrator.watch`
-  - Reads `scan-image-path.txt`, normalizes Windows paths, and detects new JPEGs/PDFs.
-  - Class: `ScanEventListener` with `scan_once()` and history helpers.
+Core modules:
+- `src/paperless_automation/orchestrator/flow.py`: high-level `ReceiptFlow`, config, and run modes.
+- `src/paperless_automation/orchestrator/watch.py`: `ScanEventListener`, watch-dir resolution from `scan-image-path.txt`.
+- `src/paperless_automation/orchestrator/transcribe.py`: `transcribe_image` via Ollama `/api/chat` (vision) with `<eot>` trimming.
+- `src/paperless_automation/orchestrator/overlay.py`: create PDF with invisible text (`render_mode=3`).
+- `src/paperless_automation/orchestrator/metadata.py`: transcript heuristics; falls back to registry extractors.
+- `src/paperless_automation/metadata/extractors.py`: registry with PDF rules (e.g., REWE) and LLM-vision extractor.
+- `src/paperless_automation/orchestrator/rename.py`: Windows-safe filename scheme `YYYY-MM-DD_<Korrespondent>_<id>`.
+- `src/paperless_automation/orchestrator/upload.py`: build upload fields, ensure resources, upload, enforce exact tags.
+- `src/paperless_automation/orchestrator/index.py`: SQLite processed index under `var/paperless_db/` + initial sync.
+- `src/paperless_automation/paperless/client.py`: Paperless‑ngx API client.
 
-- Overlay: `paperless_automation.orchestrator.overlay`
-  - Create PDF with invisible text layer. CLI mirrors previous modes via `python -m paperless_automation overlay ...`.
-  - Subcommands: `cli`, `preconsume`, `watch`.
+End-to-end (watch mode):
+1) Detect new files; compute SHA-256; skip if already processed (marks seen).
+2) For images: transcribe via Ollama → overlay invisible text PDF. For PDFs: skip overlay.
+3) Extract metadata: transcript heuristics → registry (PDF rules, LLM‑vision for images if used directly).
+4) Rename image/PDF to `YYYY-MM-DD_<Korrespondent>_<id>`.
+5) Upload to Paperless (`/api/documents/post_document/`), then best‑effort resolve doc id if missing.
+6) Enforce tags via `PATCH /api/documents/{id}` and record in processed index.
+7) Paperless indexes; OCR is skipped due to embedded text.
 
-- Metadata: `paperless_automation.orchestrator.metadata` / `paperless_automation.metadata.extractors`
-  - Heuristics, registry (PDF rules), and LLM-vision extractor for images.
-  - Builds titles like `YYYY-MM-DD - <Merchant> - 12,34` (German number format).
+## Data Locations
 
-- `upload_paperless.py`
-  - Posts to `/api/documents/post_document/` with title/created/correspondent/type/tags.
-  - Resolves or creates correspondents, document types, and tag IDs.
-  - After upload, best-effort resolves the document ID and PATCHes tags to the
-    exact mapped set from `tag_map.json` (avoids duplicates from server rules).
-
-- `ollama_transcriber.py`
-  - Encodes the image and sends a vision prompt to Ollama `/api/chat`, streaming
-    the response and returning the final text (stripped of `<eot>` if present).
-
-- `rename_documents.py`
-  - Sanitizes merchant names for filenames and keeps a shared numeric id across
-    the image and PDF to avoid collisions.
-
-- `verify_invinsible_text.py`
-  - Utility to check a PDF for embedded text and confirm `3 Tr` (invisible text).
+- Generated PDFs: `var/generated_pdfs/` (default; configurable via `--output-dir`).
+- Processed index DB: `var/paperless_db/paperless.sqlite3` (auto-created, git‑ignored).
 
 ## Troubleshooting
 
 - Token missing: ensure `PAPERLESS_TOKEN` is set or present in `.env`.
 - Folder path: `scan-image-path.txt` must point to an existing folder.
 - Ollama not reachable: confirm `OLLAMA_URL` and model availability.
-- PDF not searchable: use `verify_invinsible_text.py --pdf <file.pdf>` to inspect.
-- Windows paths: scripts auto-repair common `C:Users...` paste mistakes.
-- Verbose logs: all modules print detailed context for faster debugging.
+- Overlay not visible: use `python -m paperless_automation verify --pdf <file.pdf>`.
+- Windows paths: `fix_windows_path_input` repairs common `C:Users...` mistakes.
+- Verbose logs: set `LOG_LEVEL=DEBUG` and optionally `LOG_FILE`.
 
-## Data Locations
+## Security
 
-- Generated PDFs default to `var/generated_pdfs/` at the repository root.
-  Pass `--output-dir` to override.
-- The processed index database lives at `var/paperless_db/paperless.sqlite3`.
-  It is created automatically and ignored by git.
+- Never commit tokens. Use `.env` or environment variables.
+- The client avoids logging auth headers; logs are parameterized and context‑rich.
 
 ## License
 
