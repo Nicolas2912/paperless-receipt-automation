@@ -116,31 +116,53 @@ def _best_substring_key(norm_text: str, keys: List[str]) -> Optional[str]:
 
 
 def resolve_tag_and_key(tag_map: Dict[str, str], extracted_name: str) -> Tuple[str, Optional[str]]:
+    """Resolve a tag and canonical merchant key from a noisy extracted name.
+
+    Returns a tuple ``(tag_value, canonical_key)`` where:
+    - ``tag_value`` is the value from ``tag_map`` (or "NO TAG FOUND")
+    - ``canonical_key`` is the original, unmodified key string from ``tag_map``
+      that best matches the extracted name, using normalization, substring
+      containment and Levenshtein distance heuristics. If no reasonable match
+      is found, ``canonical_key`` is ``None``.
+    """
     if not isinstance(tag_map, dict) or not tag_map:
         return ("NO TAG FOUND", None)
+
     norm_name = normalize_korrespondent(extracted_name)
-    norm_index: Dict[str, str] = {}
-    for k, v in tag_map.items():
-        nk = normalize_korrespondent(str(k))
+
+    # Build indices from normalized key -> (original_key, tag_value)
+    norm_to_original: Dict[str, Tuple[str, str]] = {}
+    for original_key, tag_value in tag_map.items():
+        nk = normalize_korrespondent(str(original_key))
         if nk:
-            norm_index[nk] = str(v)
-    if norm_name in norm_index:
-        return (norm_index[norm_name], norm_name)
-    best_key = _best_substring_key(norm_name, list(norm_index.keys()))
-    if best_key:
-        return (norm_index[best_key], best_key)
-    best_key = None
+            norm_to_original[nk] = (str(original_key), str(tag_value))
+
+    # 1) Exact normalized match
+    if norm_name in norm_to_original:
+        orig_key, tag_val = norm_to_original[norm_name]
+        return (tag_val, orig_key)
+
+    # 2) Best substring containment on normalized keys
+    best_norm_key = _best_substring_key(norm_name, list(norm_to_original.keys()))
+    if best_norm_key:
+        orig_key, tag_val = norm_to_original[best_norm_key]
+        return (tag_val, orig_key)
+
+    # 3) Levenshtein nearest neighbor with adaptive threshold
+    best_norm_key = None
     best_dist = 10**9
     name_len = len(norm_name)
-    for k in norm_index.keys():
+    for k in norm_to_original.keys():
         if len(k) < 3:
             continue
         d = _levenshtein(norm_name, k)
         if d < best_dist:
             best_dist = d
-            best_key = k
-    if best_key is not None:
-        thr = max(1, round(0.2 * max(len(best_key), name_len)))
+            best_norm_key = k
+    if best_norm_key is not None:
+        thr = max(1, round(0.2 * max(len(best_norm_key), name_len)))
         if best_dist <= thr:
-            return (norm_index[best_key], best_key)
+            orig_key, tag_val = norm_to_original[best_norm_key]
+            return (tag_val, orig_key)
+
     return ("NO TAG FOUND", None)

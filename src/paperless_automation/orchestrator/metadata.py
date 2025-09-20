@@ -140,19 +140,19 @@ def extract_metadata(
 ) -> Optional[ExtractedMetadata]:
     """Best-effort metadata extraction for receipts.
 
-    Order:
-    1. Transcript heuristics (fast, no extra API calls).
-    2. Registry-based PDF/image extractors (pluggable custom logic, includes LLM).
+    Preferred order (to use LLM JSON when available):
+    1. Registry-based PDF/image extractors (includes LLM vision JSON output).
+    2. Transcript heuristics as a fallback.
     """
-    if transcript:
-        LOG.info("Attempting transcript heuristic extraction")
-        md = _metadata_from_transcript(transcript)
+    if source_path:
+        LOG.info("Attempting registry-based extraction (preferred)")
+        md = _metadata_via_registry(source_path, ollama_url=ollama_url, model=model)
         if md:
             return md
 
-    if source_path:
-        LOG.info("Attempting registry-based extraction")
-        md = _metadata_via_registry(source_path, ollama_url=ollama_url, model=model)
+    if transcript:
+        LOG.info("Registry-based extraction unavailable; trying transcript heuristics")
+        md = _metadata_from_transcript(transcript)
         if md:
             return md
 

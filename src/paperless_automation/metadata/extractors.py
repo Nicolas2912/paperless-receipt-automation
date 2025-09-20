@@ -248,10 +248,11 @@ class LlmVisionExtractor(BaseExtractor):
             "Rules:\n"
             "- korrespondent: the store/brand as printed (short, no URLs, no legal text).\n"
             "- ausstellungsdatum: parse date (e.g., DD.MM.YYYY) and output ISO YYYY-MM-DD. Search for a 'DATUM' field and get the value from this line.\n"
-            "- betrag_value: the grand total; dot decimal, exactly two decimals, no thousands separators.\n"
+            "- betrag_value: the **correct* grand total (which is the largest amount and near 'SUMME'); dot decimal, exactly two decimals, no thousands separators.\n"
             "- betrag_currency: 3-letter like EUR; if symbol € is shown, use EUR.\n"
             "- dokumenttyp: exactly Kassenbon.\n"
-            "- Do NOT invent data. Do NOT include any file paths. Output ONLY the JSON object."
+            "- Do NOT invent data. Do NOT include any file paths. Output ONLY the JSON object.\n"
+            "- Double check everything!"
         )
 
         try:
@@ -261,21 +262,63 @@ class LlmVisionExtractor(BaseExtractor):
             LLM_LOG.error(f"Failed reading image for LLM extractor: {exc}")
             return None
 
-        url = context.ollama_url.rstrip("/") + "/api/chat"
+        # Normalize Ollama base URL to /api/chat without duplicating the suffix
+        base = (context.ollama_url or "").rstrip("/")
+        url = base if base.endswith("/api/chat") else (base + "/api/chat")
+        LLM_LOG.debug(f"Using Ollama chat URL: {url}")
         payload = {
             "model": context.ollama_model,
             "messages": [{"role": "user", "content": prompt, "images": [b64]}],
-            "stream": False,
+            "stream": True
         }
         try:
-            r = requests.post(url, json=payload, timeout=context.timeout)
+            LLM_LOG.info("Streaming metadata JSON from Ollama (tokens will appear below)...")
+            r = requests.post(url, json=payload, timeout=context.timeout, stream=True)
             r.raise_for_status()
-            data = r.json() or {}
         except Exception as exc:
             LLM_LOG.error(f"Ollama call failed: {exc}")
             return None
 
-        content = (data.get("message") or {}).get("content") or ""
+        # Accumulate streamed tokens into a single content string while echoing
+        parts: list[str] = []
+        try:
+            for raw_line in r.iter_lines(decode_unicode=False):
+                if not raw_line:
+                    continue
+                if isinstance(raw_line, bytes):
+                    try:
+                        line = raw_line.decode(r.encoding or "utf-8", errors="ignore")
+                    except Exception:
+                        line = raw_line.decode("utf-8", errors="ignore")
+                else:
+                    line = str(raw_line)
+                line = line.strip()
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    print(line, end="", flush=True)
+                    parts.append(line)
+                    continue
+                if obj.get("error"):
+                    LLM_LOG.error(f"Ollama error: {obj['error']}")
+                    return None
+                if obj.get("done") is True:
+                    break
+                delta = ""
+                msg = obj.get("message") or {}
+                if isinstance(msg, dict):
+                    delta = msg.get("content") or ""
+                if not delta:
+                    delta = obj.get("response") or ""
+                if delta:
+                    print(delta, end="", flush=True)
+                    parts.append(delta)
+        finally:
+            print()
+
+        content = ("".join(parts)).strip()
         m = re.search(r"\{.*\}\s*$", content, re.S)
         content = m.group(0) if m else content
         try:

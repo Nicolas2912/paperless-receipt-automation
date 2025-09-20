@@ -185,7 +185,8 @@ class ReceiptFlow:
 
         metadata = extract_metadata(
             transcript=transcript,
-            source_path=pdf_path,
+            # Pass the original image so LLM vision extractor can run
+            source_path=image_path,
             ollama_url=self.config.ollama_url,
             model=self.config.ollama_model,
         )
