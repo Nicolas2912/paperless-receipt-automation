@@ -15,7 +15,7 @@ from ..config import (
     load_token as _cfg_load_token,
 )
 from ..logging import get_logger
-from ..paths import expand_abs
+from ..paths import expand_abs, find_project_root, var_dir
 from . import (
     ProcessedIndex,
     create_searchable_pdf,
@@ -27,7 +27,7 @@ from . import (
     upload_pdf_document,
 )
 
-from scan_event_listener import (
+from .watch import (
     ScanEventListener,
     list_basenames_in_dir_by_ext,
     read_watch_dir_from_file,
@@ -64,11 +64,18 @@ def build_flow_config(args, *, script_dir: str) -> FlowConfig:
     ollama_url = getattr(args, "ollama_url", None) or ollama_url_default
     ollama_model = getattr(args, "ollama_model", None) or ollama_model_default
 
-    output_dir = expand_abs(getattr(args, "output_dir", None) or "generated_pdfs")
+    # Resolve repo root (not the current working directory under src/)
+    repo_root = find_project_root(script_dir)
+
+    # Default output directory under var/ at the repo root
+    user_output_dir = getattr(args, "output_dir", None)
+    default_output_dir = os.path.join(var_dir(repo_root), "generated_pdfs")
+    output_dir = expand_abs(user_output_dir) if user_output_dir else default_output_dir
     os.makedirs(output_dir, exist_ok=True)
 
     tag_map = _cfg_load_tag_map(script_dir)
-    index = ProcessedIndex(script_dir)
+    # Keep the processed-index in var/paperless_db at repo root
+    index = ProcessedIndex(repo_root)
 
     LOG.info("Flow configuration prepared")
     LOG.info(f"Paperless base URL : {base_url}")

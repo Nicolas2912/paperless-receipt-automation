@@ -80,15 +80,6 @@ class PaperlessClient:
             self.log.error(f"POST document failed: {e}")
             raise
 
-    def get_document(self, doc_id: int) -> Optional[Dict[str, Any]]:
-        url = self._url(f"/api/documents/{int(doc_id)}/")
-        try:
-            r = self.s.get(url, timeout=self.timeout, verify=self.verify)
-            return self._json(r)
-        except Exception as e:
-            self.log.warning(f"GET document {doc_id} failed: {e}")
-            return None
-
     def patch_document(self, doc_id: int, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         url = self._url(f"/api/documents/{int(doc_id)}/")
         try:
@@ -117,17 +108,7 @@ class PaperlessClient:
         return None
 
     # ---------- tasks ----------
-    def find_task_by_uuid(self, task_uuid: str) -> Optional[Dict[str, Any]]:
-        url = self._url(f"/api/tasks/?task_id={requests.utils.quote(task_uuid)}&page_size=1")
-        try:
-            r = self.s.get(url, timeout=self.timeout, verify=self.verify)
-            data = self._json(r) or {}
-            results = data.get("results") if isinstance(data, dict) else None
-            if results and isinstance(results, list) and isinstance(results[0], dict):
-                return results[0]
-        except Exception as e:
-            self.log.warning(f"find_task_by_uuid failed: {e}")
-        return None
+    # Note: get_document and find_task_by_uuid removed as unused helpers.
 
     # ---------- resources (by name) ----------
     def _get_first_by_name(self, resource: str, name: str) -> Optional[Dict[str, Any]]:

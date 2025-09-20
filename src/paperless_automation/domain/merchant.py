@@ -2,29 +2,12 @@ from typing import Dict, List, Optional, Tuple
 import re
 import unicodedata
 
-# Shared logging (Phase 1)
-try:
-    from src.paperless_automation.logging import get_logger  # type: ignore
-except Exception:
-    def get_logger(name: str):  # type: ignore
-        class _L:
-            def info(self, m):
-                print(f"[{name}] {m}")
-            debug = info
-            warning = info
-            error = info
-        return _L()
+from ..logging import get_logger
 
-_LOG = get_logger("merchant-normalization")
+LOG = get_logger("merchant")
 
 
 def _only_letters_and_spaces(s: str) -> str:
-    """Keep only Unicode letters and spaces, preserving German umlauts.
-
-    - Operates on NFC-normalized text so characters like 'u' + combining
-      diaeresis become 'ü' and are retained as letters.
-    - Collapses any whitespace runs to a single ASCII space and strips ends.
-    """
     kept: List[str] = []
     for ch in (s or ""):
         if ch.isalpha() or ch.isspace():
@@ -38,13 +21,24 @@ def _remove_legal_tokens(s: str) -> str:
     if not s:
         return s
     tokens = [
-        "gmbh co kg", "gmbh und co kg", "and co", "co kg",
-        # Handle both 'beschraenkter' and 'beschränkter' spellings
+        "gmbh co kg",
+        "gmbh und co kg",
+        "and co",
+        "co kg",
         "gesellschaft mit beschraenkter haftung",
         "gesellschaft mit beschränkter haftung",
         "aktiengesellschaft",
-        "kommanditgesellschaft", "offene handelsgesellschaft", "eingetragener kaufmann",
-        "gmbh", "ag", "kg", "ug", "se", "ek", "ohg", "spa",
+        "kommanditgesellschaft",
+        "offene handelsgesellschaft",
+        "eingetragener kaufmann",
+        "gmbh",
+        "ag",
+        "kg",
+        "ug",
+        "se",
+        "ek",
+        "ohg",
+        "spa",
     ]
     out = f" {s} "
     for t in tokens:
@@ -56,32 +50,20 @@ def _remove_legal_tokens(s: str) -> str:
 
 
 def normalize_korrespondent(name: str) -> str:
-    """Normalize a merchant/korrespondent name while preserving umlauts.
-
-    Steps (with debug prints):
-    - Trim and unwrap simple JSON-like `merchant:"..."` shapes.
-    - Normalize to NFC to preserve composed umlauts (ä/ö/ü/Ä/Ö/Ü/ß).
-    - Lowercase (Unicode-aware).
-    - Keep only letters and spaces (Unicode-aware), collapse whitespace.
-    - Remove common German legal form tokens.
-    """
     raw_input = name or ""
     raw = raw_input.strip()
     m = re.match(r'^\s*"?(merchant|korrespondent)"?\s*:\s*"?(.+?)"?\s*,?\s*$', raw, flags=re.IGNORECASE)
     if m:
         raw = m.group(2).strip()
 
-    # Replace NBSP with a normal space and normalize to NFC so combining marks
-    # become composed characters (e.g., 'u' + '\u0308' -> 'ü').
     raw = raw.replace("\u00A0", " ")
     nfc = unicodedata.normalize("NFC", raw)
     lowered = nfc.lower()
     letters_spaces = _only_letters_and_spaces(lowered)
     cleaned = _remove_legal_tokens(letters_spaces)
 
-    # Verbose debug prints for diagnostics
     try:
-        _LOG.info(
+        LOG.info(
             "raw=\"{}\" | nfc=\"{}\" | lowered=\"{}\" | letters_only=\"{}\" | cleaned=\"{}\"".format(
                 raw_input, nfc, lowered, letters_spaces, cleaned
             )
@@ -115,14 +97,6 @@ def _levenshtein(a: str, b: str) -> int:
 
 
 def _best_substring_key(norm_text: str, keys: List[str]) -> Optional[str]:
-    """Return the best key contained as substring in norm_text.
-
-    Rules:
-    - Prefer the longest matching key.
-    - For very short keys (<3), only accept if they match at the start of
-      the normalized text (prefix match), to avoid accidental hits.
-    - For len>=3, accept anywhere as substring.
-    """
     if not norm_text or not keys:
         return None
     best: Tuple[int, Optional[str]] = (0, None)
@@ -140,56 +114,8 @@ def _best_substring_key(norm_text: str, keys: List[str]) -> Optional[str]:
     return best[1]
 
 
-def choose_tag_for_korrespondent(tag_map: Dict[str, str], extracted_name: str) -> str:
-    """Return a tag using exact, substring, then Levenshtein fallback.
-
-    Threshold: max(1, round(0.2 * max(len(key), len(name))))
-    Keys shorter than 3 are excluded from fuzzy to avoid noise.
-    If nothing matches, return "NO TAG FOUND".
-    """
-    if not isinstance(tag_map, dict) or not tag_map:
-        return "NO TAG FOUND"
-
-    norm_name = normalize_korrespondent(extracted_name)
-    norm_index: Dict[str, str] = {}
-    for k, v in tag_map.items():
-        nk = normalize_korrespondent(str(k))
-        if nk:
-            norm_index[nk] = str(v)
-
-    # Exact
-    if norm_name in norm_index:
-        return norm_index[norm_name]
-
-    # Substring (prefer longest; allows prefix for very short keys like 'dm')
-    best_key = _best_substring_key(norm_name, list(norm_index.keys()))
-    if best_key:
-        return norm_index[best_key]
-
-    # Fuzzy
-    best_key = None
-    best_dist = 10**9
-    name_len = len(norm_name)
-    for k in norm_index.keys():
-        if len(k) < 3:
-            continue
-        d = _levenshtein(norm_name, k)
-        if d < best_dist:
-            best_dist = d
-            best_key = k
-    if best_key is not None:
-        thr = max(1, round(0.2 * max(len(best_key), name_len)))
-        if best_dist <= thr:
-            return norm_index[best_key]
-
-    return "NO TAG FOUND"
-
 
 def resolve_tag_and_key(tag_map: Dict[str, str], extracted_name: str) -> Tuple[str, Optional[str]]:
-    """Return (tag_name, matched_key) using the same strategy as above.
-    matched_key is the normalized key from tag_map if a match was found,
-    else None. Tag is "NO TAG FOUND" if nothing matched.
-    """
     if not isinstance(tag_map, dict) or not tag_map:
         return ("NO TAG FOUND", None)
     norm_name = normalize_korrespondent(extracted_name)

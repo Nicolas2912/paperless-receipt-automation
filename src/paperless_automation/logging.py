@@ -63,12 +63,4 @@ def get_logger(name: str) -> logging.Logger:
     return logger
 
 
-def set_level(level: str | int) -> None:
-    """Dynamically set level on all configured loggers from this package."""
-    lvl = _coerce_level(level)
-    for name, logger in logging.Logger.manager.loggerDict.items():
-        if isinstance(logger, logging.Logger) and getattr(logger, "_paperless_configured", False):
-            logger.setLevel(lvl)
-            for h in logger.handlers:
-                h.setLevel(lvl)
-
+## Note: dynamic set_level utility removed as it was unused.

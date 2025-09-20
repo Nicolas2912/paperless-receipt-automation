@@ -9,24 +9,9 @@ from typing import Any, Dict, List, Optional
 from ..domain.models import ExtractedMetadata
 from ..logging import get_logger
 from ..paperless.client import PaperlessClient
+from ..domain.merchant import resolve_tag_and_key
 
 LOG = get_logger("orchestrator-upload")
-
-try:
-    from merchant_normalization import resolve_tag_and_key  # type: ignore
-except Exception:  # pragma: no cover - fallback
-    def resolve_tag_and_key(tag_map: Dict[str, str], extracted_name: str):  # type: ignore
-        return "NO TAG FOUND", None
-
-try:
-    from upload_paperless import (
-        upload_document,
-        ensure_correspondent_id,
-        ensure_document_type_id,
-        ensure_tag_ids,
-    )  # type: ignore
-except Exception as exc:  # pragma: no cover - defensive fallback
-    raise RuntimeError(f"upload_paperless helpers unavailable: {exc}")
 
 
 @dataclass
@@ -54,18 +39,20 @@ def prepare_upload_fields(
             metadata.korrespondent = matched_key
             LOG.info(f"Updated korrespondent to canonical tag key: {matched_key}")
         if tag_name and tag_name != "NO TAG FOUND":
-            tag_ids = ensure_tag_ids(base_url, token, [tag_name])
+            client_tags = PaperlessClient(base_url, token)
+            tag_ids = client_tags.ensure_tags([tag_name])
             LOG.info(f"Ensured tag ids {tag_ids} for tag '{tag_name}'")
         else:
             LOG.info("No tag mapping found; proceeding without enforced tags")
 
-    correspondent_id = ensure_correspondent_id(base_url, token, metadata.korrespondent)
+    client = PaperlessClient(base_url, token)
+    correspondent_id = client.ensure_correspondent(metadata.korrespondent)
     if correspondent_id:
         LOG.info(f"Ensured correspondent '{metadata.korrespondent}' -> id={correspondent_id}")
     else:
         LOG.warning(f"Could not ensure correspondent '{metadata.korrespondent}'")
 
-    document_type_id = ensure_document_type_id(base_url, token, metadata.dokumenttyp)
+    document_type_id = client.ensure_document_type(metadata.dokumenttyp)
     if document_type_id:
         LOG.info(f"Ensured document type '{metadata.dokumenttyp}' -> id={document_type_id}")
     else:
@@ -110,21 +97,17 @@ def upload_pdf_document(
     LOG.info("Uploading PDF to Paperless")
     LOG.debug(f"PDF path: {pdf_path}")
 
-    response = upload_document(
+    client = PaperlessClient(base_url, token, timeout=timeout, verify_tls=verify_tls)
+    response = client.post_document(
         file_path=pdf_path,
-        base_url=base_url,
-        token=token,
         title=fields.get("title"),
         created=fields.get("created"),
         correspondent_id=fields.get("correspondent_id"),
         tag_ids=fields.get("tag_ids"),
         document_type_id=fields.get("document_type_id"),
-        timeout=timeout,
-        verify_tls=verify_tls,
     )
 
     doc_id = _extract_doc_id(response)
-    client = PaperlessClient(base_url, token, timeout=timeout, verify_tls=verify_tls)
 
     if doc_id is None and fields.get("title"):
         LOG.info("Document id not in response; searching by title")
@@ -153,4 +136,3 @@ def upload_pdf_document(
         title=fields.get("title") or "",
         original_filename=original_filename,
     )
-

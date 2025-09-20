@@ -76,51 +76,55 @@ pip install pymupdf requests
 
 ## Main Usage
 
-The orchestrator is `main_paperless_flow.py`, with two modes.
+All entry points now live under `src/paperless_automation`. Use the unified CLI:
 
 - Watch mode (continuous):
 
   ```powershell
-  python .\main_paperless_flow.py --mode watch --base-url http://<host>:<port>
+  python -m paperless_automation watch --base-url http://<host>:<port>
   ```
 
 - Single-file mode (one image):
 
   ```powershell
-  python .\main_paperless_flow.py --mode single --source "C:\path\to\image.jpg" --base-url http://<host>:<port>
+  python -m paperless_automation single --source "C:\path\to\image.jpg" --base-url http://<host>:<port>
+  ```
+
+- Equivalent, explicit form with the flow command:
+
+  ```powershell
+  python -m paperless_automation flow --mode watch
+  python -m paperless_automation flow --mode single --source "C:\path\to\file.pdf"
   ```
 
 Useful flags / env vars:
 - `--base-url` or `PAPERLESS_BASE_URL` (default `http://localhost:8000`)
 - `--token` or `PAPERLESS_TOKEN` (read from `.env` if not passed)
-- `--output-dir` (default `generated_pdfs`)
+- `--output-dir` (default `var/generated_pdfs` under the repo root)
 - `--ollama-url` or `OLLAMA_URL` (default `http://localhost:11434`)
 - `--ollama-model` or `OLLAMA_MODEL` (default `qwen2.5vl-receipt:latest`)
 - `--insecure` to skip TLS verification when using HTTPS test setups
 
 Processing steps (watch mode):
-1) Detect a new JPEG via `scan_event_listener.py`.
-2) Transcribe via Ollama (`ollama_transcriber.py`).
-3) Create a searchable PDF with invisible text (`preconsume_overlay_pdf.py`).
-4) Extract metadata (heuristics on the transcript; fallback to LLM on PDF).
-5) Rename image + PDF to `YYYY-MM-DD_<Merchant>_<id>.*` (`rename_documents.py`).
-6) Upload to Paperless‑ngx (`upload_paperless.py`) and enforce mapped tags.
+1) Detect new files via `paperless_automation.orchestrator.watch.ScanEventListener`.
+2) Transcribe via Ollama (`paperless_automation.orchestrator.transcribe`).
+3) Create a searchable PDF with invisible text (`paperless_automation.orchestrator.overlay`).
+4) Extract metadata (heuristics + registry; includes LLM for images).
+5) Rename image + PDF to `YYYY-MM-DD_<Merchant>_<id>.*` (`paperless_automation.orchestrator.rename`).
+6) Upload to Paperless‑ngx (`paperless_automation.orchestrator.upload`) and enforce mapped tags.
 
 ## Script Tooling
 
-- `scan_event_listener.py`
-  - Reads `scan-image-path.txt`, normalizes Windows paths, and detects new JPEGs.
-  - Exported class: `ScanEventListener` with `scan_once()` and history helpers.
+- Watcher: `paperless_automation.orchestrator.watch`
+  - Reads `scan-image-path.txt`, normalizes Windows paths, and detects new JPEGs/PDFs.
+  - Class: `ScanEventListener` with `scan_once()` and history helpers.
 
-- `preconsume_overlay_pdf.py`
-  - Create PDF with invisible text layer. Three subcommands:
-    - `cli`: `--image`, `--output`, `--text|--text-file|--ollama-*`
-    - `preconsume`: run under Paperless pre-consume using `DOCUMENT_WORKING_PATH`
-    - `watch`: watch a folder and write PDFs to `--output-dir`
+- Overlay: `paperless_automation.orchestrator.overlay`
+  - Create PDF with invisible text layer. CLI mirrors previous modes via `python -m paperless_automation overlay ...`.
+  - Subcommands: `cli`, `preconsume`, `watch`.
 
-- `extract_metadata.py`
-  - Calls Ollama to return strict JSON with keys
-    `{korrespondent, ausstellungsdatum, betrag_value, betrag_currency, dokumenttyp}`.
+- Metadata: `paperless_automation.orchestrator.metadata` / `paperless_automation.metadata.extractors`
+  - Heuristics, registry (PDF rules), and LLM-vision extractor for images.
   - Builds titles like `YYYY-MM-DD - <Merchant> - 12,34` (German number format).
 
 - `upload_paperless.py`
@@ -148,6 +152,13 @@ Processing steps (watch mode):
 - PDF not searchable: use `verify_invinsible_text.py --pdf <file.pdf>` to inspect.
 - Windows paths: scripts auto-repair common `C:Users...` paste mistakes.
 - Verbose logs: all modules print detailed context for faster debugging.
+
+## Data Locations
+
+- Generated PDFs default to `var/generated_pdfs/` at the repository root.
+  Pass `--output-dir` to override.
+- The processed index database lives at `var/paperless_db/paperless.sqlite3`.
+  It is created automatically and ignored by git.
 
 ## License
 

@@ -35,7 +35,7 @@ class ExtractionContext:
     ollama_url: str
     ollama_model: str
     timeout: int = 120
-    vendor_hint: Optional[str] = None
+    # Reserved for future hints; currently unused fields removed
     cache: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -63,8 +63,7 @@ def register(key: str, extractor_cls: Type[BaseExtractor]) -> None:
     LOG.debug(f"Registered extractor {key} -> {extractor_cls.__name__}")
 
 
-def list_extractors() -> List[Tuple[str, Type[BaseExtractor]]]:
-    return list(_REGISTRY)
+## Note: list_extractors removed as unused API.
 
 
 def detect_media_type(path: str) -> str:
@@ -118,22 +117,6 @@ def _get_pdf_lines(path: str, context: ExtractionContext) -> List[str]:
         PDF_LOG.error(f"PyMuPDF is required for PDF extraction: {exc}")
         raise
 
-    lines: List[str] = []
-    with fitz.open(path) as doc:
-        PDF_LOG.info(f"Opened PDF with {doc.page_count} page(s)")
-        for page_index in range(doc.page_count):
-            page = doc.load_page(page_index)
-            text = page.get_text("text") or ""
-            page_lines = [ln.rstrip("\r") for ln in text.splitlines()]
-            PDF_LOG.info(
-                "Page %s extracted (lines=%s chars=%s)",
-                page_index + 1,
-                len(page_lines),
-                len(text),
-            )
-            lines.extend(page_lines)
-    context.cache[cache_key] = lines
-    return lines
     lines: List[str] = []
     with fitz.open(path) as doc:
         PDF_LOG.info(f"Opened PDF with {doc.page_count} page(s)")
@@ -218,8 +201,7 @@ class RewePdfExtractor(BaseExtractor):
 
         korrespondent = "REWE"
         try:
-            from merchant_normalization import normalize_korrespondent  # type: ignore
-
+            from ..domain.merchant import normalize_korrespondent
             korrespondent = normalize_korrespondent(korrespondent)
         except Exception as exc:
             PDF_LOG.debug(f"Could not normalize korrespondent: {exc}")
@@ -246,3 +228,86 @@ class RewePdfExtractor(BaseExtractor):
         if metadata.betrag_value == "0.00":
             PDF_LOG.warning("[PDF] betrag_value fallback in use (0.00)")
         return metadata
+
+
+class LlmVisionExtractor(BaseExtractor):
+    media_types = ("image",)
+
+    def try_extract(self, path: str, context: ExtractionContext) -> Optional[ExtractedMetadata]:
+        # Build the same prompt used by legacy extractor
+        prompt = (
+            "You read a single retail receipt (Kassenbon). Return ONLY one compact JSON object, "
+            "no code fences, no extra text, no paths, no explanations. Use EXACTLY these keys:\n"
+            "{\n"
+            "  \"korrespondent\": string,\n"
+            "  \"ausstellungsdatum\": \"YYYY-MM-DD\",\n"
+            "  \"betrag_value\": \"0.00\",\n"
+            "  \"betrag_currency\": \"EUR\",\n"
+            "  \"dokumenttyp\": \"Kassenbon\"\n"
+            "}\n"
+            "Rules:\n"
+            "- korrespondent: the store/brand as printed (short, no URLs, no legal text).\n"
+            "- ausstellungsdatum: parse date (e.g., DD.MM.YYYY) and output ISO YYYY-MM-DD. Search for a 'DATUM' field and get the value from this line.\n"
+            "- betrag_value: the grand total; dot decimal, exactly two decimals, no thousands separators.\n"
+            "- betrag_currency: 3-letter like EUR; if symbol € is shown, use EUR.\n"
+            "- dokumenttyp: exactly Kassenbon.\n"
+            "- Do NOT invent data. Do NOT include any file paths. Output ONLY the JSON object."
+        )
+
+        try:
+            with open(path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("utf-8")
+        except Exception as exc:
+            LLM_LOG.error(f"Failed reading image for LLM extractor: {exc}")
+            return None
+
+        url = context.ollama_url.rstrip("/") + "/api/chat"
+        payload = {
+            "model": context.ollama_model,
+            "messages": [{"role": "user", "content": prompt, "images": [b64]}],
+            "stream": False,
+        }
+        try:
+            r = requests.post(url, json=payload, timeout=context.timeout)
+            r.raise_for_status()
+            data = r.json() or {}
+        except Exception as exc:
+            LLM_LOG.error(f"Ollama call failed: {exc}")
+            return None
+
+        content = (data.get("message") or {}).get("content") or ""
+        m = re.search(r"\{.*\}\s*$", content, re.S)
+        content = m.group(0) if m else content
+        try:
+            obj = json.loads(content)
+        except Exception:
+            LLM_LOG.error("LLM did not return valid JSON")
+            return None
+
+        try:
+            kor = (obj.get("korrespondent") or obj.get("merchant") or "").strip()
+            date_iso = normalize_date_iso(str(obj.get("ausstellungsdatum", "").strip())) or "1970-01-01"
+            amt = normalize_amount(obj.get("betrag_value")) or "0.00"
+            cur = (obj.get("betrag_currency") or "EUR").strip().upper()
+            from ..domain.merchant import normalize_korrespondent as _norm
+
+            md = ExtractedMetadata(
+                korrespondent=_norm(kor) or "Unbekannt",
+                ausstellungsdatum=date_iso,
+                betrag_value=amt,
+                betrag_currency=cur,
+            )
+            LLM_LOG.info("[LLM] korrespondent     : %s", md.korrespondent)
+            LLM_LOG.info("[LLM] ausstellungsdatum: %s", md.ausstellungsdatum)
+            LLM_LOG.info("[LLM] betrag_value     : %s", md.betrag_value)
+            LLM_LOG.info("[LLM] betrag_currency  : %s", md.betrag_currency)
+            LLM_LOG.info("[LLM] title (preview)  : %s", md.title())
+            return md
+        except Exception as exc:
+            LLM_LOG.error(f"Failed to build ExtractedMetadata from LLM JSON: {exc}")
+            return None
+
+
+# Register built-in extractors
+register("pdf-rewe", RewePdfExtractor)
+register("llm-vision", LlmVisionExtractor)

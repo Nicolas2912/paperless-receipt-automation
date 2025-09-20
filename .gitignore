@@ -20,6 +20,12 @@ venv/
 scan-image-path.txt
 *.pdf
 generated_pdfs/
+paperless_db/
+var/
+
+# Stray outputs if something was run from src/
+src/generated_pdfs/
+src/paperless_db/
 
 # OS/editor noise
 .DS_Store

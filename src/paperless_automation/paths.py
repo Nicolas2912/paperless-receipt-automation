@@ -28,3 +28,31 @@ def expand_abs(path: str) -> str:
     """Expand env vars and ~ then return absolute path."""
     return os.path.abspath(os.path.expanduser(os.path.expandvars(path or "")))
 
+
+def find_project_root(start_dir: str | None = None) -> str:
+    """Find the repository root by walking upward from start_dir.
+
+    Looks for common markers: .git/, tag_map.json, requirements.txt, README.md.
+    Falls back to absolute(start_dir) if nothing found.
+    """
+    d = os.path.abspath(start_dir or os.getcwd() or ".")
+    try:
+        while True:
+            # Directory marker (.git)
+            if os.path.isdir(os.path.join(d, ".git")):
+                return d
+            # File markers
+            for marker in ("tag_map.json", "requirements.txt", "README.md"):
+                if os.path.isfile(os.path.join(d, marker)):
+                    return d
+            parent = os.path.dirname(d)
+            if parent == d:
+                return d
+            d = parent
+    except Exception:
+        return d
+
+
+def var_dir(root_dir: str) -> str:
+    """Return the absolute var directory under the project root."""
+    return os.path.join(os.path.abspath(root_dir), "var")

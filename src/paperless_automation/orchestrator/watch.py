@@ -1,58 +1,62 @@
 import os
 import sys
 import time
-from typing import Set, Optional, List, Iterable
+from typing import Iterable, List, Optional, Set
 
-# Centralized path to 'scan-image-path.txt' defined once
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-SCAN_IMAGE_CONFIG_PATH = os.path.join(SCRIPT_DIR, "scan-image-path.txt")
+from ..logging import get_logger
 
-# --- Configuration: watched file extensions ---------------------------------
-# Edit this set to change which file types trigger the watcher. Extensions are
-# case-insensitive, but MUST include the leading dot. Keep it small and clear.
-# Default per request: only .jpg, .jpeg, and .pdf
-WATCH_EXTS: Set[str] = {".jpg", ".jpeg", ".pdf"}
-
-
-# New shared logging (Phase 1)
-try:
-    from src.paperless_automation.logging import get_logger  # type: ignore
-except Exception:
-    def get_logger(name: str):  # type: ignore
-        class _L:
-            def info(self, m):
-                ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                print(f"[{ts}] [{name}] {m}", flush=True)
-            debug = info
-            warning = info
-            error = info
-        return _L()
-
-_LOG = get_logger("scan-event-listener")
+LOG = get_logger("scan-event-listener")
 
 
 def debug_print(msg: str) -> None:
-    _LOG.info(msg)
+    LOG.info(msg)
+
+
+def _find_upwards(start_dir: str, filename: str) -> Optional[str]:
+    """Return first matching file found when walking up from start_dir."""
+    d = os.path.abspath(start_dir or ".")
+    while True:
+        candidate = os.path.join(d, filename)
+        if os.path.isfile(candidate):
+            return candidate
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def _default_scan_image_config_path() -> str:
+    # Prefer CWD, searching upwards to repo root
+    found = _find_upwards(os.getcwd(), "scan-image-path.txt")
+    if found:
+        return found
+    # Fallback: search relative to this module location (installed package case)
+    module_dir = os.path.dirname(os.path.abspath(__file__))
+    found = _find_upwards(module_dir, "scan-image-path.txt")
+    if found:
+        return found
+    # Final fallback: default to CWD path for clearer error message
+    return os.path.abspath(os.path.join(os.getcwd(), "scan-image-path.txt"))
+
+
+WATCH_EXTS: Set[str] = {".jpg", ".jpeg", ".pdf"}
 
 
 def read_watch_dir_from_file(config_path: Optional[str] = None) -> str:
-    """
-    Reads the directory path to watch from a text file.
-    Trims whitespace and surrounding quotes to be forgiving.
-    """
-    cfg = config_path or SCAN_IMAGE_CONFIG_PATH
+    cfg = config_path or _default_scan_image_config_path()
     debug_print(f"Reading watch directory from: {cfg}")
     try:
-        with open(cfg, "r", encoding="utf-8-sig") as f:  # utf-8 with BOM tolerant
+        with open(cfg, "r", encoding="utf-8-sig") as f:
             lines = [ln.strip() for ln in f.readlines()]
     except FileNotFoundError:
-        debug_print("ERROR: scan-image-path.txt not found. Ensure it exists next to this script.")
-        sys.exit(1)
+        debug_print(
+            "ERROR: scan-image-path.txt not found. Place it in repo root, current working directory, or next to the module."
+        )
+        raise SystemExit(1)
     except Exception as e:
         debug_print(f"ERROR: Failed reading scan-image-path.txt: {e}")
-        sys.exit(1)
+        raise SystemExit(1)
 
-    # Find the first non-empty, non-comment line
     raw_line = ""
     for ln in lines:
         if not ln or ln.startswith("#") or ln.startswith(";"):
@@ -61,50 +65,28 @@ def read_watch_dir_from_file(config_path: Optional[str] = None) -> str:
         break
     if not raw_line:
         debug_print("ERROR: scan-image-path.txt is empty or only comments.")
-        sys.exit(1)
+        raise SystemExit(1)
 
     debug_print(f"Raw config line: {raw_line!r}")
-
-    # If line is in KEY=VALUE format (e.g., PATH=...), extract the VALUE part
     if "=" in raw_line:
-        key, value = raw_line.split("=", 1)
-        debug_print(f"Detected key/value: key={key.strip()!r}, value={value.strip()!r}")
+        _, value = raw_line.split("=", 1)
         raw_path = value.strip()
     else:
         raw_path = raw_line.strip()
 
-    # Remove optional wrapping quotes
     if (raw_path.startswith('"') and raw_path.endswith('"')) or (raw_path.startswith("'") and raw_path.endswith("'")):
         raw_path = raw_path[1:-1]
         debug_print(f"Unquoted path: {raw_path!r}")
 
-    # Expand environment variables and ~
-    expanded = os.path.expandvars(raw_path)
-    expanded = os.path.expanduser(expanded)
-    debug_print(f"Expanded path: {expanded!r}")
-
-    # Normalize separators to current OS
+    expanded = os.path.expandvars(os.path.expanduser(raw_path))
     normalized = os.path.normpath(expanded)
     debug_print(f"Normalized path: {normalized!r}")
-
-    # On Windows, repair malformed drive paths like C:Users...
-    if os.name == "nt" and len(normalized) >= 2 and normalized[1] == ":" and "\\" not in normalized and "/" not in normalized:
-        drive, rest = normalized[:2], normalized[2:]
-        repaired = drive + "\\" + "\\".join(rest.split("\\"))
-        debug_print(f"Heuristic repaired path from {normalized!r} to {repaired!r}")
-        normalized = repaired
-
     abs_path = os.path.abspath(normalized)
     debug_print(f"Absolute path: {abs_path!r}")
-
     return abs_path
 
 
 def _normalize_exts(exts: Iterable[str]) -> Set[str]:
-    """Return a lowercase set of extensions, ensuring they start with a dot.
-
-    Example: ["jpg", ".JPEG"] -> {".jpg", ".jpeg"}
-    """
     out: Set[str] = set()
     for e in exts:
         if not e:
@@ -117,12 +99,6 @@ def _normalize_exts(exts: Iterable[str]) -> Set[str]:
 
 
 def list_basenames_in_dir_by_ext(directory: str, exts: Iterable[str]) -> Set[str]:
-    """Return a set of basenames present in directory filtered by extensions.
-
-    - Non-recursive; top-level only
-    - Case-insensitive match on extension
-    - Returns basenames (not absolute paths)
-    """
     watch_exts = _normalize_exts(exts)
     try:
         entries = os.listdir(directory)
@@ -146,19 +122,7 @@ def list_basenames_in_dir_by_ext(directory: str, exts: Iterable[str]) -> Set[str
     return files
 
 
-# Backwards-compat helper retained (JPEGs only), though internal code now
-# uses list_basenames_in_dir_by_ext with WATCH_EXTS.
-def list_jpeg_basenames_in_dir(directory: str) -> Set[str]:
-    return list_basenames_in_dir_by_ext(directory, {".jpg", ".jpeg", ".jpe", ".jfif"})
-
-
 class ScanEventListener:
-    """
-    Watches a directory for newly created JPEG files and keeps running.
-    Stores the absolute path of the most recently detected image in
-    `last_new_image_path` and keeps a history in `new_image_paths`.
-    """
-
     def __init__(
         self,
         *,
@@ -168,42 +132,22 @@ class ScanEventListener:
         print_on_detect: bool = True,
         exts: Optional[Iterable[str]] = None,
     ) -> None:
-        # Resolve watch directory from argument or config file
         if watch_dir:
             self.watch_dir = os.path.abspath(os.path.expanduser(os.path.expandvars(watch_dir)))
             debug_print(f"Using provided watch directory: {self.watch_dir}")
         else:
-            cfg = config_path or SCAN_IMAGE_CONFIG_PATH
+            cfg = config_path or _default_scan_image_config_path()
             self.watch_dir = read_watch_dir_from_file(cfg)
 
-        # Validate directory
         if not os.path.isdir(self.watch_dir):
             debug_print(
                 f"ERROR: Watch directory does not exist or is not a directory: {self.watch_dir!r}"
             )
-            exists = os.path.exists(self.watch_dir)
-            debug_print(
-                f"Exists: {exists}; isfile: {os.path.isfile(self.watch_dir)}; "
-                f"isdir: {os.path.isdir(self.watch_dir)}"
-            )
-            parent = os.path.dirname(self.watch_dir) or "."
-            debug_print(f"Parent directory: {parent!r}")
-            try:
-                sample = []
-                for name in os.listdir(parent):
-                    sample.append(name)
-                    if len(sample) >= 10:
-                        break
-                debug_print(f"Parent contents (up to 10): {sample}")
-            except Exception as e:
-                debug_print(f"Failed to list parent directory: {e}")
             raise SystemExit(1)
 
-        # Extensions to watch
         self.exts: Set[str] = _normalize_exts(exts or WATCH_EXTS)
         debug_print(f"Watching for extensions: {sorted(self.exts)}")
 
-        # State
         self.poll_interval_sec = float(poll_interval_sec)
         self.print_on_detect = bool(print_on_detect)
         self.baseline: Set[str] = list_basenames_in_dir_by_ext(self.watch_dir, self.exts)
@@ -215,16 +159,7 @@ class ScanEventListener:
         debug_print("Watching for newly created files with configured extensions...")
         debug_print("Press Ctrl+C to exit manually.")
 
-    def get_last_new_image_path(self) -> Optional[str]:
-        """Return the absolute path of the last detected image (or None)."""
-        return self.last_new_image_path
-
-    def get_all_detected_paths(self) -> List[str]:
-        """Return a copy of all detected absolute image paths."""
-        return list(self.new_image_paths)
-
     def scan_once(self) -> List[str]:
-        """Scan the directory once and return a list of newly detected absolute paths."""
         current = list_basenames_in_dir_by_ext(self.watch_dir, self.exts)
         if len(current) != self.last_seen_count:
             debug_print(f"Detected change in watched-file count: {self.last_seen_count} -> {len(current)}")
@@ -246,7 +181,6 @@ class ScanEventListener:
                 self.last_new_image_path = image_path
                 self.new_image_paths.append(image_path)
                 abs_new_paths.append(image_path)
-            # Update baseline so these files are not reported again
             self.baseline |= new_files
 
         return abs_new_paths
@@ -259,14 +193,3 @@ class ScanEventListener:
         except KeyboardInterrupt:
             debug_print("Interrupted by user. Exiting.")
             raise SystemExit(130)
-
-
-def main_scaneventlistener() -> None:
-    listener = ScanEventListener()
-    listener.run()
-
-
-if __name__ == "__main__":
-    from src.paperless_automation.cli.main import main as cli_main
-
-    cli_main(["scan-listener", *sys.argv[1:]])

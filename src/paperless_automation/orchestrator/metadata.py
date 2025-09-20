@@ -12,11 +12,7 @@ from ..logging import get_logger
 
 LOG = get_logger("orchestrator-metadata")
 
-try:  # Optional dependency: merchant normalization is legacy but preferred.
-    from merchant_normalization import normalize_korrespondent  # type: ignore
-except Exception:  # pragma: no cover - fallback
-    def normalize_korrespondent(value: str) -> str:  # type: ignore
-        return (value or "").strip()
+from ..domain.merchant import normalize_korrespondent
 
 
 _TRANSCRIPT_BLACKLIST = {"kassenbon", "rechnung", "beleg", "bon"}
@@ -134,19 +130,6 @@ def _metadata_via_registry(path: str, *, ollama_url: str, model: str) -> Optiona
     return extract_with_registry(path, context)
 
 
-def _metadata_via_legacy(path: str, *, ollama_url: str, model: str) -> Optional[ExtractedMetadata]:
-    try:
-        from extract_metadata import extract_from_source  # type: ignore
-    except Exception as exc:  # pragma: no cover - legacy fallback missing
-        LOG.error(f"Legacy extract_metadata import failed: {exc}")
-        return None
-
-    try:
-        return extract_from_source(path, ollama_url=ollama_url, model=model)
-    except Exception as exc:
-        LOG.error(f"Legacy extract_from_source raised {exc}")
-        return None
-
 
 def extract_metadata(
     *,
@@ -159,8 +142,7 @@ def extract_metadata(
 
     Order:
     1. Transcript heuristics (fast, no extra API calls).
-    2. Registry-based PDF/image extractors (pluggable custom logic).
-    3. Legacy extract_metadata.extract_from_source fallback.
+    2. Registry-based PDF/image extractors (pluggable custom logic, includes LLM).
     """
     if transcript:
         LOG.info("Attempting transcript heuristic extraction")
@@ -174,27 +156,5 @@ def extract_metadata(
         if md:
             return md
 
-    LOG.info("Falling back to legacy metadata extractor")
-    md = _metadata_via_legacy(source_path, ollama_url=ollama_url, model=model)
-    if md:
-        try:
-            LOG.debug("Legacy metadata JSON dump follows")
-            preview = json.dumps(
-                {
-                    "korrespondent": md.korrespondent,
-                    "ausstellungsdatum": md.ausstellungsdatum,
-                    "betrag_value": md.betrag_value,
-                    "betrag_currency": md.betrag_currency,
-                    "title": md.title(),
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-            for line in preview.splitlines():
-                LOG.debug(line)
-        except Exception:
-            pass
-    else:
-        LOG.error("All metadata extraction strategies failed")
-    return md
-
+    LOG.error("All metadata extraction strategies failed")
+    return None

@@ -7,6 +7,23 @@ from .logging import get_logger
 log = get_logger("config")
 
 
+def _find_upwards(start_dir: str, filename: str) -> Optional[str]:
+    """Return first matching file found when walking up from start_dir.
+
+    This makes running tools from subdirectories (e.g., `src/`) still find
+    repository-level config files like `.env` and `tag_map.json`.
+    """
+    d = os.path.abspath(start_dir or ".")
+    while True:
+        candidate = os.path.join(d, filename)
+        if os.path.isfile(candidate):
+            return candidate
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
 def _read_dotenv(dotenv_dir: str) -> Dict[str, str]:
     """Minimal .env reader (no external dependencies).
 
@@ -15,9 +32,9 @@ def _read_dotenv(dotenv_dir: str) -> Dict[str, str]:
     - Returns mapping; does not mutate environment.
     """
     env: Dict[str, str] = {}
-    path = os.path.join(os.path.abspath(dotenv_dir), ".env")
-    if not os.path.isfile(path):
-        log.debug(f"No .env found at: {path}")
+    path = _find_upwards(dotenv_dir, ".env")
+    if not path:
+        log.debug(f"No .env found starting from: {os.path.abspath(dotenv_dir)}")
         return env
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -33,7 +50,7 @@ def _read_dotenv(dotenv_dir: str) -> Dict[str, str]:
                 if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
                     v = v[1:-1]
                 env[k] = v.strip()
-        log.debug(f"Loaded {len(env)} key(s) from .env")
+        log.debug(f"Loaded {len(env)} key(s) from .env at {path}")
     except Exception as e:
         log.warning(f"Failed reading .env: {e}")
     return env
@@ -74,17 +91,16 @@ def load_ollama(dotenv_dir: str) -> Tuple[str, str]:
 
 
 def load_tag_map(script_dir: str) -> Dict[str, str]:
-    path = os.path.join(os.path.abspath(script_dir), "tag_map.json")
-    if not os.path.isfile(path):
+    path = _find_upwards(script_dir, "tag_map.json")
+    if not path:
         log.info("No tag_map.json found; proceeding without tag mapping")
         return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
-            log.info(f"Loaded tag_map.json with {len(data)} entries")
+            log.info(f"Loaded tag_map.json with {len(data)} entries from {path}")
             return {str(k).lower(): str(v) for k, v in data.items()}
     except Exception as e:
         log.warning(f"Failed to read tag_map.json: {e}")
     return {}
-
