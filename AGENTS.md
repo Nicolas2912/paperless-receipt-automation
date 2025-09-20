@@ -39,12 +39,6 @@ Note on generated artifacts:
   spirit). Do not log secrets.
 - Paths: use helpers in `paths.py` (e.g., `expand_abs`) and be Windows‑safe.
 
-## Testing Guidelines
-
-- Framework: pytest. Place tests in `tests/`, files named `test_*.py`.
-- Focus: unit tests for orchestrator utilities and CLI argument plumbing.
-- Avoid network calls; mock HTTP interactions with Paperless/Ollama.
-- Aim for fast, isolated tests; prefer temporary dirs/files.
 
 ## Commit & Pull Request Guidelines
 
