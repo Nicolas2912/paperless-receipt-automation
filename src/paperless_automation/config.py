@@ -104,3 +104,31 @@ def load_tag_map(script_dir: str) -> Dict[str, str]:
     except Exception as e:
         log.warning(f"Failed to read tag_map.json: {e}")
     return {}
+
+
+def load_openai(dotenv_dir: str) -> Optional[str]:
+    """Return OpenAI API key from env or .env.
+
+    - Reads only OPENAI_API_KEY (or lowercase openai_api_key) from env/.env.
+    - No custom base URL support; SDK defaults to the official endpoint.
+    """
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if api_key:
+        return api_key.strip()
+    env = _read_dotenv(dotenv_dir)
+    v = (env.get("OPENAI_API_KEY") or env.get("openai_api_key"))
+    return v.strip() if v else None
+
+
+def load_openrouter(dotenv_dir: str) -> Optional[str]:
+    """Return OpenRouter API key from env or .env.
+
+    Looks for OPEN_ROUTER_API_KEY (or lowercase variant) to match
+    scripts/test_openrouter_api.py convention.
+    """
+    v = os.environ.get("OPEN_ROUTER_API_KEY")
+    if v:
+        return v.strip()
+    env = _read_dotenv(dotenv_dir)
+    v = env.get("OPEN_ROUTER_API_KEY") or env.get("open_router_api_key")
+    return v.strip() if v else None

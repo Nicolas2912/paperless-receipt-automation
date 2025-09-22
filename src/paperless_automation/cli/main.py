@@ -18,6 +18,7 @@ from ..orchestrator.verify import verify_pdf
 from ..orchestrator.transcribe import transcribe_image
 from ..orchestrator.metadata import extract_metadata
 from ..paths import expand_abs
+from ..orchestrator.productdb import ReceiptExtractionService
 
 LOG = get_logger("cli-main")
 
@@ -233,6 +234,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         listener.run()
         return 0
     scan_cmd.set_defaults(handler=_scan)
+
+    # Product DB tools (scaffold)
+    pdb = subparsers.add_parser(
+        "productdb",
+        help="Product/receipt database utilities (scaffold)",
+        description="Initialize the product DB and run extraction stubs.",
+    )
+    pdb_sub = pdb.add_subparsers(dest="pdb_cmd", required=True)
+
+    pdb_init = pdb_sub.add_parser("init", help="Create/ensure the product DB schema exists")
+    def _pdb_init(_: argparse.Namespace) -> int:
+        svc = ReceiptExtractionService()
+        path = svc.init_database()
+        LOG.info(f"Product DB ready at: {path}")
+        print(path)
+        return 0
+    pdb_init.set_defaults(handler=_pdb_init)
+
+    pdb_extract = pdb_sub.add_parser("extract", help="Run OpenAI extraction, validate, and insert into DB")
+    pdb_extract.add_argument("--source", required=True, help="Path to receipt image (JPG/PNG)")
+    pdb_extract.add_argument("--model", default="gpt-5-mini")
+    def _pdb_extract(ns: argparse.Namespace) -> int:
+        svc = ReceiptExtractionService()
+        result = svc.run_and_persist(ns.source, model_name=ns.model, script_dir=os.getcwd())
+        if result is None:
+            LOG.error("Extraction failed.")
+            return 1
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    pdb_extract.set_defaults(handler=_pdb_extract)
 
     args = parser.parse_args(provided)
     code = args.handler(args)
