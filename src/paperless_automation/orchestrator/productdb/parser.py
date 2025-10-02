@@ -113,6 +113,9 @@ def parse_and_validate_payload(payload: Any) -> Dict[str, Any]:
     if not isinstance(items_in, list) or not items_in:
         raise JsonValidationError("items must be a non-empty list")
     norm_items: List[Dict[str, Any]] = []
+    gross_values: List[int] = []
+    net_values: List[int] = []
+    tax_values: List[int] = []
     for idx, it in enumerate(items_in):
         if not isinstance(it, dict):
             raise JsonValidationError(f"items[{idx}] must be an object")
@@ -134,6 +137,12 @@ def parse_and_validate_payload(payload: Any) -> Dict[str, Any]:
         # Optional sanity: recompute when possible
         if lg is None and ln is not None and lt is not None:
             lg = ln + lt
+        if lg is not None:
+            gross_values.append(int(lg))
+        if ln is not None:
+            net_values.append(int(ln))
+        if lt is not None:
+            tax_values.append(int(lt))
         norm_items.append(
             {
                 "product_name": name,
@@ -159,6 +168,23 @@ def parse_and_validate_payload(payload: Any) -> Dict[str, Any]:
         "sha256": _norm_s(src.get("sha256")),
     }
 
+    # Totals fallback if missing
+    if total_gross is None and gross_values:
+        total_gross = sum(gross_values)
+    if total_net is None and len(net_values) == len(norm_items) and norm_items:
+        total_net = sum(net_values)
+    if total_tax is None and len(tax_values) == len(norm_items) and norm_items:
+        total_tax = sum(tax_values)
+    if total_tax is None and total_gross is not None and total_net is not None:
+        total_tax = total_gross - total_net
+    if total_net is None and total_gross is not None and total_tax is not None:
+        total_net = total_gross - total_tax
+
+    raw_content = None
+    rc_candidate = payload.get("raw_content")
+    if isinstance(rc_candidate, str) and rc_candidate.strip():
+        raw_content = rc_candidate.strip()
+
     normalized = {
         "merchant": {"name": merchant_name, "address": address},
         "purchase_date_time": purchase_date_time,
@@ -168,5 +194,10 @@ def parse_and_validate_payload(payload: Any) -> Dict[str, Any]:
         "items": norm_items,
         "source_file": source_file,
     }
+    if raw_content:
+        normalized["raw_content"] = raw_content
+    enrichment = payload.get("_enrichment")
+    if isinstance(enrichment, dict) and enrichment:
+        normalized["_enrichment"] = enrichment
     LOG.debug("Normalized payload ready with %d items", len(norm_items))
     return normalized

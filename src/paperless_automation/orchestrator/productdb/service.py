@@ -49,8 +49,17 @@ class ReceiptExtractionService:
         # Insert raw JSON payload for traceability
         import json as _json
 
-        raw_json_id = self.db.insert_text(_json.dumps(payload, ensure_ascii=False))
-        LOG.debug("Inserted raw payload text_id=%s", raw_json_id)
+        payload_for_storage = dict(payload)
+        raw_text = payload_for_storage.pop("raw_content", None)
+        raw_json_id = self.db.insert_text(_json.dumps(payload_for_storage, ensure_ascii=False))
+        raw_text_id: Optional[int] = None
+        if isinstance(raw_text, str) and raw_text.strip():
+            raw_text_id = self.db.insert_text(raw_text.strip())
+        LOG.debug(
+            "Inserted payload artifacts json_id=%s raw_text_id=%s",
+            raw_json_id,
+            raw_text_id,
+        )
 
         # Insert merchant + address
         addr_dict = payload["merchant"].get("address") or {}
@@ -72,7 +81,7 @@ class ReceiptExtractionService:
             "total_tax": payload.get("totals", {}).get("total_tax"),
             "total_gross": payload.get("totals", {}).get("total_gross"),
             "source_file_id": source_file_id,
-            "raw_content_id": raw_json_id,
+            "raw_content_id": raw_text_id or raw_json_id,
         }
         receipt_id = self.db.insert_receipt(rcpt_dict)
         LOG.debug("Inserted receipt_id=%s", receipt_id)
@@ -101,6 +110,8 @@ class ReceiptExtractionService:
             "receipt_id": receipt_id,
             "item_count": item_count,
             "extraction_run_id": run_id,
+            "raw_payload_text_id": raw_json_id,
+            "raw_text_id": raw_text_id,
         }
         LOG.info("Persisted extraction: %s", summary)
         return summary

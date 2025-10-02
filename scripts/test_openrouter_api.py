@@ -4,11 +4,13 @@ import os
 
 
 dotenv_path=r"C:\Users\Anwender\Desktop\Nicolas\Dokumente\MeineProgramme\paperless-receipt-automation\.env"
+dotenv_path_win = r"C:\Users\Anwender\Desktop\Nicolas\Dokumente\MeineProgramme\paperless-receipt-automation\.env"
 
-load_dotenv(dotenv_path=r"C:\Users\Anwender\Desktop\Nicolas\Dokumente\MeineProgramme\paperless-receipt-automation\.env")
+
+load_dotenv(dotenv_path_win=r"C:\Users\Anwender\Desktop\Nicolas\Dokumente\MeineProgramme\paperless-receipt-automation\.env")
 
 # Debug output
-print(f"File exists: {os.path.exists(dotenv_path)}")  # True/False
+print(f"File exists: {os.path.exists(dotenv_path)}")  # True/Falses
 api_key = os.getenv("OPEN_ROUTER_API_KEY")
 
 client = OpenAI(
@@ -18,7 +20,7 @@ client = OpenAI(
 
 completion = client.chat.completions.create(
   extra_body={},
-  model="x-ai/grok-4-fast:free",
+  model="meta-llama/llama-4-maverick:free",
   messages=[
     {
       "role": "user",

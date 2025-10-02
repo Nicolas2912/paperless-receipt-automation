@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -26,6 +28,7 @@ from . import (
     transcribe_image,
     upload_pdf_document,
 )
+from .productdb import ReceiptExtractionService
 
 from .watch import (
     ScanEventListener,
@@ -49,6 +52,7 @@ class FlowConfig:
     tag_map: Dict[str, str]
     index: ProcessedIndex
     script_dir: str
+    repo_root: str
 
 
 def build_flow_config(args, *, script_dir: str) -> FlowConfig:
@@ -97,6 +101,7 @@ def build_flow_config(args, *, script_dir: str) -> FlowConfig:
         tag_map=tag_map,
         index=index,
         script_dir=script_dir,
+        repo_root=repo_root,
     )
 
 
@@ -107,6 +112,7 @@ class ReceiptFlow:
         self.config = config
         LOG.info("ReceiptFlow orchestrator ready")
         LOG.info(f"Index database path: {self.config.index.db_path}")
+        self._productdb_service: Optional[ReceiptExtractionService] = None
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -143,6 +149,82 @@ class ReceiptFlow:
         except Exception as exc:
             LOG.warning(f"Failed to record processed item: {exc}")
 
+    def _get_productdb_service(self) -> ReceiptExtractionService:
+        if self._productdb_service is None:
+            self._productdb_service = ReceiptExtractionService()
+            LOG.info("Product DB extraction service initialized")
+        return self._productdb_service
+
+    def _preserve_original_image(self, path: str) -> Optional[str]:
+        if not path:
+            return None
+        try:
+            if not os.path.isfile(path):
+                LOG.debug(f"Original image not found for preservation: {path}")
+                return None
+            dest_dir = os.path.join(var_dir(self.config.repo_root), "productdb", "sources")
+            os.makedirs(dest_dir, exist_ok=True)
+            unique_name = f"{uuid.uuid4().hex}_{os.path.basename(path)}"
+            dest_path = os.path.join(dest_dir, unique_name)
+            shutil.copy2(path, dest_path)
+            LOG.debug(f"Copied original image for product DB extraction: {dest_path}")
+            return dest_path
+        except Exception as exc:
+            LOG.warning(f"Failed to preserve original image for product DB extraction: {exc}")
+            return None
+
+    def _run_productdb_pipeline(
+        self,
+        *,
+        original_path: str,
+        active_path: str,
+        preserved_path: Optional[str],
+    ) -> None:
+        def _cleanup(path: Optional[str]) -> None:
+            if path and os.path.isfile(path):
+                try:
+                    os.remove(path)
+                    LOG.debug(f"Removed preserved image copy: {path}")
+                except OSError as exc:
+                    LOG.debug(f"Failed to remove preserved image copy: {exc}")
+
+        try:
+            service = self._get_productdb_service()
+        except Exception as exc:
+            LOG.warning(f"Product DB extraction unavailable; skipping. Reason: {exc}")
+            _cleanup(preserved_path)
+            return
+
+        candidates = [
+            preserved_path,
+            original_path,
+            active_path,
+        ]
+        source_path = None
+        for candidate in candidates:
+            if candidate and os.path.isfile(candidate):
+                source_path = candidate
+                break
+
+        if not source_path:
+            LOG.warning("Skipping product DB extraction; no accessible image path found")
+            _cleanup(preserved_path)
+            return
+
+        LOG.info(f"Running product DB extraction for image: {source_path}")
+        try:
+            summary = service.run_and_persist(
+                source_path,
+                script_dir=self.config.script_dir,
+            )
+            if summary:
+                LOG.info(f"Product DB persistence summary: {summary}")
+            else:
+                LOG.warning("Product DB extraction produced no summary")
+        except Exception as exc:
+            LOG.error(f"Product DB extraction failed: {exc}")
+        finally:
+            _cleanup(preserved_path)
     # ------------------------------------------------------------------
     # Core processing steps
     # ------------------------------------------------------------------
@@ -168,6 +250,8 @@ class ReceiptFlow:
         file_hash, skip = self._preflight_hash(image_path)
         if skip:
             return None
+
+        preserved_image_path = self._preserve_original_image(image_path)
 
         transcript = transcribe_image(
             image_path,
@@ -230,6 +314,12 @@ class ReceiptFlow:
             upload_title=result.title,
             upload_doc_id=result.doc_id,
             original_filename=result.original_filename,
+        )
+
+        self._run_productdb_pipeline(
+            original_path=image_path,
+            active_path=new_image_path,
+            preserved_path=preserved_image_path,
         )
 
         return new_pdf_path

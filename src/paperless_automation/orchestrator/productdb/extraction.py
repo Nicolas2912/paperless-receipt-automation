@@ -1,25 +1,43 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
 import base64, hashlib, json, logging, mimetypes, os, time, sys
+from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import httpx  # NEW
 from openai import OpenAI, APIConnectionError, APITimeoutError, APIStatusError
+from dotenv import load_dotenv
 
-from ...logging import get_logger
-from ...config import load_openai, load_ollama, load_openrouter
+
+try:
+    from ...logging import get_logger
+    from ...config import load_openai, load_ollama, load_openrouter
+except Exception:
+    # Allow running this file directly (no package parent)
+    _HERE = os.path.dirname(__file__)
+    _SRC = os.path.abspath(os.path.join(_HERE, "../../.."))
+    if _SRC not in sys.path:
+        sys.path.insert(0, _SRC)
+    from paperless_automation.logging import get_logger
+    from paperless_automation.config import load_openai, load_ollama, load_openrouter
 import requests
 
 LOG = get_logger("productdb-extraction")
 
+ENV_PATH_WIN = r"C:\Users\Anwender\Desktop\Nicolas\Dokumente\MeineProgramme\paperless-receipt-automation\.env"
+
+load_dotenv(dotenv_path=ENV_PATH_WIN)
+
 # Backend and model toggles
 # - BACKEND: "openai", "ollama", or "openrouter" (env: PRODUCTDB_BACKEND)
-BACKEND: str = "openrouter"
+BACKEND: str = (os.getenv("PRODUCTDB_BACKEND") or "openrouter").strip().lower()
 # - MODEL: default Ollama model tag (env: OLLAMA_MODEL)
-MODEL: str = (os.environ.get("OLLAMA_MODEL") or "gemma3:4b").strip()
+MODEL: str = (os.getenv("OLLAMA_MODEL") or "gemma3:4b").strip()
 # - OPENROUTER_MODEL: default model id for OpenRouter backend
-OPENROUTER_MODEL: str = (os.environ.get("OPENROUTER_MODEL") or "qwen/qwen2.5-vl-72b-instruct:free").strip()
-print(OPENROUTER_MODEL)
+OPENROUTER_MODEL: str = (os.getenv("OPENROUTER_MODEL"))
+if OPENROUTER_MODEL:
+    LOG.debug("Configured OpenRouter model: %s", OPENROUTER_MODEL)
 
 # ---------- file helpers (unchanged) ----------
 def _b64_data_url(path: str) -> Optional[str]:
@@ -56,59 +74,118 @@ def _file_facts(path: str) -> Dict[str, Any]:
     mime, _ = mimetypes.guess_type(path)
     return {"filename": os.path.basename(path), "mime_type": mime, "byte_size": size, "sha256": sha256}
 
+
+# ---------- dataclasses & containers ----------
+
+
+@dataclass(frozen=True)
+class FileFacts:
+    """Normalized view of the source file metadata used for provenance logging."""
+
+    filename: Optional[str]
+    mime_type: Optional[str]
+    byte_size: Optional[int]
+    sha256: Optional[str]
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "FileFacts":
+        return cls(
+            filename=data.get("filename"),
+            mime_type=data.get("mime_type"),
+            byte_size=data.get("byte_size"),
+            sha256=data.get("sha256"),
+        )
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "filename": self.filename,
+            "mime_type": self.mime_type,
+            "byte_size": self.byte_size,
+            "sha256": self.sha256,
+        }
+
+
+@dataclass(frozen=True)
+class OpenRouterConfig:
+    """Configuration set required to talk to the OpenRouter API."""
+
+    api_key: str
+    model_name: str
+    temperature: float = 0.0
+    max_tokens: int = 8000
+    timeout_seconds: int = 180
+
+
 # ---------- prompt & schema (your originals) ----------
 def _prompt() -> str:
     return """
-        You extract structured data from a retail receipt image.
+Extract data from a retail receipt image.
 
-        Output requirements (strict):
-        - Return ONLY strict JSON (no code fences, no commentary).
-        - The top-level object MUST have exactly these keys (no extras):
-        merchant, purchase_date_time, currency, payment_method, totals, items
-        - All money values are integers in euro cents (e.g., 3.49€ → 349).
-        - Use dot for decimals in any floats (e.g., tax_rate 0.19), not comma.
+Output requirements (strict):
 
-        Field specifications:
-        - merchant: { name: string, address: { street: string|null, city: string|null, postal_code: string|null, country: string|null } }
-        • Split address components if visible; otherwise set field to null. Country may be null.
-        - purchase_date_time: string formatted as YYYY-MM-DDTHH:MM:SS (no timezone). If only a date is visible, set time to 12:00:00.
-        - currency: 3-letter ISO code. Map the symbol '€' to 'EUR'. If unknown, use 'EUR'.
-        - payment_method: one of ['CASH','CARD','OTHER'].
-        • Map common forms: BAR/Bargeld → 'CASH'. KARTE/EC/EC-Karte/Girocard/Visa/Mastercard/Kontaktlos → 'CARD'.
-        - totals: { total_net: int|null, total_tax: int|null, total_gross: int|null }.
-        • If totals are not printed, compute from items when possible.
-        - items: array of objects. Each item has:
-        { product_name: string, quantity: number (>0), unit: string|null (e.g., 'x','kg','g','l','ml'),
-            unit_price_net: int|null, unit_price_gross: int|null,
-            tax_rate: 0.0|0.07|0.19,
-            line_net: int|null, line_tax: int|null, line_gross: int|null }
+Return ONLY strict JSON (no code fences, no commentary).
+The top-level object MUST have exactly these keys:
 
-        Computation and consistency rules:
-        - Convert any printed decimals (comma or dot) to integer cents in output.
-        - Prefer computing line values from quantity × unit_price_(net/gross) with standard rounding (half up to nearest cent) when unit prices are present.
-        - Ensure line_gross = line_net + line_tax whenever both are present.
-        - Compute totals so that total_gross ≈ sum(items.line_gross) within ±2 cents tolerance; if needed, distribute 1–2 cents to reconcile rounding.
-        - Do NOT output negative money amounts. If discounts/coupons are present, incorporate them into the affected items (adjust unit_price or line values) so that items and totals reflect the final paid amounts without negative lines. Ignore returns/cancellations.
-        - Exclude non-product/administrative rows from items (e.g., 'SUMME', 'GESAMT', 'USt', 'MwSt', 'Zwischensumme', loyalty points, payment change, cash-back, store slogans). Only include purchasable line items.
+- merchant
+- date
+- currency
+- payment_method
+- items
 
-        VAT/tax marker hints (Germany):
-        - Map tax markers to tax_rate as follows:
-        • 'MwSt', 'USt', 'VAT', 'Tax' followed by '19' or '19%' → 0.19.
-        • 'MwSt', 'USt' followed by '7' or '7%' → 0.07.
-        • '0' or '0%' or explicit 'steuerfrei'/'tax free' → 0.00.
-        - Many receipts label items with letters 'A','B','C' where a legend shows A=19%, B=7%, etc. Use the legend to assign each item's tax_rate accordingly.
-        - If an item has no explicit tax marker but a nearby column/letter indicates grouping, inherit from that group; otherwise default to 0.19.
-        - Do not infer unusual rates other than 0.00, 0.07, 0.19.
+Field specifications:
+- merchant:
 
-        Ambiguity resolution:
-        - If time is missing, set 12:00:00; if date is completely missing, infer the most likely date from context (e.g., header/footer) and use that.
-        - If currency is not explicit but the receipt is German and shows '€', use 'EUR'.
-        - For 'Pfand' (deposit) lines: use the receipt's tax legend if present; if ambiguous, prefer the group/letter the receipt assigns. Only use 0.00 if the receipt’s VAT table marks that group as 0%/tax-free.
-        - Use ASCII quotes and ensure valid JSON; do not include trailing commas.
+	{ "name": string, "street": string, "city": string, "postal_code": string }
 
-        Important: An example structure may have been shown to illustrate the
-        JSON shape. DO NOT copy or reuse any example values (like merchant
-        names or amounts). Base the output strictly on the provided receipt.
+- date: purchase date in "DD.MM.YYYY" format
+- currency: 3-letter code
+- payment_method: CASH | CARD | OTHER
+- items: array of objects. Each item has:
+
+	{ "product_name": string, "line_gross": int, "amount": int, "tax": decimal }
+
+Rules:
+- line_gross = price in euro cents (e.g., 3.49€ → 349).
+- tax = tax as decimal (e.g., 19% → 0.19, 7% → 0.07).
+- amount = actual quantity (should be read as the numeric amount listed next to or below the product).
+- Only include purchasable line items (exclude headers, totals, discounts, etc.).
+- Please search on the receipt for something that indicates the payment method (CASH, CARD, OTHER).
+- Do not repeat yourself. End exactly with the last item in the list.
+
+Example:
+
+	{
+	  "merchant": {
+	    "name": "Rewe Supermarkt",
+	    "street": "Musterstraße 12",
+	    "city": "Berlin",
+	    "postal_code": "12345"
+	  },
+	  "date": "27.09.2025",
+      "currency": "EUR",
+      "payment_method": "CARD",
+	  "items": [
+	    {
+	      "product_name": "Gala Äpfel 1kg",
+	      "line_gross": 299,
+	      "amount": 2,
+	      "tax": 0.07
+	    },
+	    {
+	      "product_name": "Milch 1L",
+	      "line_gross": 119,
+	      "amount": 1,
+	      "tax": 0.07
+	    },
+	    {
+	      "product_name": "Nutella 450g",
+	      "line_gross": 369,
+	      "amount": 1,
+	      "tax": 0.19
+	    }
+	  ]
+	}
+    
 """
 
 def _receipt_schema() -> Dict[str, Any]:
@@ -171,14 +248,439 @@ def _receipt_schema() -> Dict[str, Any]:
         },
     }
 
+
+def _scavenge_json_block(s: str) -> Optional[Dict[str, Any]]:
+    if not s:
+        return None
+    start = s.find("{")
+    end = s.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    for idx in range(end, start, -1):
+        try:
+            return json.loads(s[start:idx + 1])
+        except Exception:
+            continue
+    return None
+
+
+class PayloadNormalizer:
+    """Normalize OpenRouter JSON into the shape expected by the parser/service."""
+
+    DATE_FALLBACK_FORMATS: Tuple[str, ...] = (
+        "%d.%m.%Y",
+        "%d.%m.%y",
+        "%Y-%m-%d",
+        "%d-%m-%Y",
+        "%Y/%m/%d",
+    )
+
+    def __init__(self, facts: FileFacts) -> None:
+        self.facts = facts
+
+    def normalize(self, raw: Dict[str, Any]) -> Dict[str, Any]:
+        merchant = self._normalize_merchant(raw.get("merchant"))
+        purchase_date_time = self._normalize_purchase_date(
+            raw.get("purchase_date_time") or raw.get("date") or raw.get("purchase_date")
+        )
+        currency = (str(raw.get("currency")) if raw.get("currency") else "EUR").upper()
+        payment_method = (str(raw.get("payment_method")) if raw.get("payment_method") else "OTHER").upper()
+
+        items = [item for item in self._normalize_items(raw.get("items") or []) if item]
+        totals = self._normalize_totals(raw.get("totals"), items)
+
+        normalized: Dict[str, Any] = {
+            "merchant": merchant,
+            "purchase_date_time": purchase_date_time,
+            "currency": currency,
+            "payment_method": payment_method,
+            "totals": totals,
+            "items": items,
+            "source_file": self.facts.as_dict(),
+        }
+
+        raw_content = raw.get("raw_content")
+        if isinstance(raw_content, str) and raw_content.strip():
+            normalized["raw_content"] = raw_content.strip()
+
+        return normalized
+
+    # ---- merchant/address helpers -------------------------------------------------
+    def _normalize_merchant(self, payload: Any) -> Dict[str, Any]:
+        merchant_raw = payload if isinstance(payload, dict) else {}
+        address_raw = merchant_raw.get("address") if isinstance(merchant_raw.get("address"), dict) else {
+            "street": merchant_raw.get("street"),
+            "city": merchant_raw.get("city"),
+            "postal_code": merchant_raw.get("postal_code"),
+            "country": merchant_raw.get("country"),
+        }
+
+        def _clean(value: Any) -> Optional[str]:
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            return None
+
+        merchant = {
+            "name": _clean(merchant_raw.get("name")) or "",
+            "address": {
+                "street": _clean(address_raw.get("street")),
+                "city": _clean(address_raw.get("city")),
+                "postal_code": _clean(address_raw.get("postal_code")),
+                "country": _clean(address_raw.get("country")),
+            },
+        }
+        return merchant
+
+    # ---- item helpers -------------------------------------------------------------
+    def _normalize_items(self, payload_items: List[Any]) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        for candidate in payload_items:
+            if not isinstance(candidate, dict):
+                continue
+            item = self._normalize_item(candidate)
+            if item:
+                items.append(item)
+        return items
+
+    def _normalize_item(self, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        name = self._text(item.get("product_name") or item.get("name"))
+        if not name:
+            return None
+
+        quantity = self._coerce_quantity(item.get("quantity") or item.get("amount"))
+        tax_rate = self._normalize_tax_rate(item.get("tax_rate") or item.get("tax"))
+
+        line_gross = self._coerce_int_cents(item.get("line_gross") or item.get("gross") or item.get("total"))
+        line_net = self._coerce_int_cents(item.get("line_net"))
+        line_tax = self._coerce_int_cents(item.get("line_tax"))
+
+        if line_net is None or line_tax is None:
+            computed_net, computed_tax = self._compute_net_and_tax(line_gross, tax_rate)
+            line_net = line_net if line_net is not None else computed_net
+            line_tax = line_tax if line_tax is not None else computed_tax
+
+        if line_net is not None and line_gross is not None and line_tax is None:
+            line_tax = line_gross - line_net
+        if line_tax is not None and line_gross is not None and line_net is None:
+            line_net = line_gross - line_tax
+
+        unit_price_gross = self._coerce_int_cents(item.get("unit_price_gross"))
+        if unit_price_gross is None:
+            unit_price_gross = self._compute_unit_value(line_gross, quantity)
+
+        unit_price_net = self._coerce_int_cents(item.get("unit_price_net"))
+        if unit_price_net is None:
+            unit_price_net = self._compute_unit_value(line_net, quantity)
+
+        normalized = {
+            "product_name": name,
+            "quantity": float(quantity),
+            "unit": self._text(item.get("unit") or item.get("measure")),
+            "unit_price_net": unit_price_net,
+            "unit_price_gross": unit_price_gross,
+            "tax_rate": float(tax_rate),
+            "line_net": line_net,
+            "line_tax": line_tax,
+            "line_gross": line_gross,
+        }
+        return normalized
+
+    # ---- totals helpers -----------------------------------------------------------
+    def _normalize_totals(self, totals_payload: Any, items: List[Dict[str, Any]]) -> Dict[str, Optional[int]]:
+        totals_raw = totals_payload if isinstance(totals_payload, dict) else {}
+        totals = {
+            "total_net": self._coerce_int_cents(totals_raw.get("total_net")),
+            "total_tax": self._coerce_int_cents(totals_raw.get("total_tax")),
+            "total_gross": self._coerce_int_cents(totals_raw.get("total_gross")),
+        }
+
+        computed_totals = self._summarize_totals(items)
+        for key, value in computed_totals.items():
+            if totals.get(key) is None and value is not None:
+                totals[key] = value
+        return totals
+
+    # ---- primitive helpers -------------------------------------------------------
+    @staticmethod
+    def _text(value: Any) -> Optional[str]:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return None
+
+    @staticmethod
+    def _round_half_up(value: Decimal) -> int:
+        try:
+            return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+        except InvalidOperation:
+            return int(value)
+
+    @staticmethod
+    def _coerce_decimal(value: Any) -> Optional[Decimal]:
+        if value is None:
+            return None
+        if isinstance(value, int):
+            return Decimal(value)
+        if isinstance(value, float):
+            return Decimal(str(value))
+        if isinstance(value, str) and value.strip():
+            try:
+                return Decimal(value.replace(",", "."))
+            except Exception:
+                return None
+        return None
+
+    @classmethod
+    def _coerce_int_cents(cls, value: Any) -> Optional[int]:
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(round(value))
+        if isinstance(value, str) and value.strip():
+            try:
+                cleaned = value.strip().replace("€", "").replace(",", ".")
+                if "." in cleaned:
+                    return int(round(float(cleaned)))
+                return int(cleaned)
+            except Exception:
+                return None
+        decimal_value = cls._coerce_decimal(value)
+        return int(decimal_value) if decimal_value is not None else None
+
+    @staticmethod
+    def _coerce_quantity(value: Any) -> float:
+        if value is None:
+            return 1.0
+        try:
+            qty = float(value)
+            return qty if qty > 0 else 1.0
+        except Exception:
+            return 1.0
+
+    @staticmethod
+    def _normalize_tax_rate(value: Any) -> float:
+        candidate: Optional[float] = None
+        if isinstance(value, (int, float)):
+            candidate = float(value)
+        elif isinstance(value, str) and value.strip():
+            try:
+                candidate = float(value.strip().replace("%", ""))
+                if candidate > 1:
+                    candidate /= 100.0
+            except Exception:
+                candidate = None
+
+        if candidate is None:
+            return 0.19
+
+        for target in (0.0, 0.07, 0.19):
+            if abs(candidate - target) < 0.02:
+                return target
+        return 0.19 if candidate > 0.1 else 0.07
+
+    @classmethod
+    def _compute_net_and_tax(cls, line_gross: Optional[int], tax_rate: float) -> Tuple[Optional[int], Optional[int]]:
+        if line_gross is None:
+            return None, None
+        if tax_rate in (None, 0.0):
+            return line_gross, 0
+
+        gross_dec = Decimal(line_gross)
+        divisor = Decimal("1") + Decimal(str(tax_rate))
+        try:
+            net_dec = gross_dec / divisor
+        except InvalidOperation:
+            return None, None
+
+        net = cls._round_half_up(net_dec)
+        tax = int(gross_dec - Decimal(net))
+        return net, tax
+
+    @classmethod
+    def _compute_unit_value(cls, total_cents: Optional[int], quantity: float) -> Optional[int]:
+        if total_cents is None or quantity <= 0:
+            return total_cents
+        try:
+            per_unit = Decimal(total_cents) / Decimal(str(quantity))
+        except InvalidOperation:
+            return total_cents
+        return cls._round_half_up(per_unit)
+
+    @classmethod
+    def _summarize_totals(cls, items: List[Dict[str, Any]]) -> Dict[str, Optional[int]]:
+        gross_values = [it.get("line_gross") for it in items if it.get("line_gross") is not None]
+        net_values = [it.get("line_net") for it in items if it.get("line_net") is not None]
+        tax_values = [it.get("line_tax") for it in items if it.get("line_tax") is not None]
+
+        total_gross = sum(gross_values) if gross_values else None
+        total_net = sum(net_values) if len(net_values) == len(items) else (sum(net_values) if net_values else None)
+        if total_net is None and total_gross is not None and tax_values:
+            total_net = total_gross - sum(tax_values)
+        total_tax = sum(tax_values) if tax_values else (
+            total_gross - total_net if (total_gross is not None and total_net is not None) else None
+        )
+
+        return {
+            "total_net": total_net,
+            "total_tax": total_tax,
+            "total_gross": total_gross,
+        }
+
+    def _normalize_purchase_date(self, raw_value: Any) -> Optional[str]:
+        if not raw_value:
+            return None
+        text = str(raw_value).strip()
+        if not text:
+            return None
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            return dt.replace(tzinfo=None).isoformat(timespec="seconds")
+        except Exception:
+            pass
+
+        for fmt in self.DATE_FALLBACK_FORMATS:
+            try:
+                dt = datetime.strptime(text, fmt)
+                return dt.replace(hour=12, minute=0, second=0).isoformat(timespec="seconds")
+            except Exception:
+                continue
+        return None
+
+
+def _normalize_openrouter_payload(raw: Dict[str, Any], *, facts: FileFacts) -> Dict[str, Any]:
+    """Facilitate backwards compatibility for existing call sites."""
+
+    normalizer = PayloadNormalizer(facts)
+    return normalizer.normalize(raw)
+
+
+class OpenRouterClient:
+    """Thin wrapper around OpenRouter API requests with helpful logging."""
+
+    ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
+
+    def __init__(self, config: OpenRouterConfig) -> None:
+        self.config = config
+
+    # ---- core request helpers ----------------------------------------------------
+    def chat(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        timeout: Optional[int] = None,
+    ) -> Optional[str]:
+        payload = {
+            "model": self.config.model_name,
+            "messages": messages,
+            "temperature": self.config.temperature if temperature is None else temperature,
+            "max_tokens": self.config.max_tokens if max_tokens is None else max_tokens,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+        }
+        try:
+            resp = requests.post(
+                self.ENDPOINT,
+                headers=headers,
+                json=payload,
+                timeout=timeout or self.config.timeout_seconds,
+            )
+        except Exception as exc:
+            LOG.error("OpenRouter request failed: %s", exc)
+            return None
+
+        if resp.status_code >= 400:
+            LOG.error("OpenRouter HTTP %s: %s", resp.status_code, resp.text[:500])
+            return None
+
+        body = resp.json()
+        choices = body.get("choices") or []
+        if not choices:
+            LOG.error("OpenRouter returned no choices: %s", body)
+            return None
+        message = choices[0].get("message") or {}
+        return message.get("content")
+
+    def json_request(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        timeout: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        text = self.chat(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except Exception:
+            return _scavenge_json_block(text)
+
+    # ---- convenience helpers -----------------------------------------------------
+    def guess_country(self, data_url: str, context: Dict[str, Any]) -> Optional[str]:
+        context_text = json.dumps(context, ensure_ascii=False)
+        prompt = (
+            "Estimate the likely ISO 3166-1 alpha-2 country code for the merchant on this retail receipt. "
+            "Use signals such as language, city names, postal codes, addresses, currency symbols, and other hints. "
+            "Return strict JSON with a single key 'country'."
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"{prompt}\n\nStructured context:\n{context_text}"},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ]
+        result = self.json_request(messages, max_tokens=200, timeout=150)
+        if not result:
+            return None
+        country = result.get("country")
+        if isinstance(country, str) and country.strip():
+            return country.strip().upper()
+        return None
+
+    def fetch_raw_content(self, data_url: str) -> Optional[str]:
+        prompt = (
+            "Transcribe the receipt exactly as text, preserving line order. "
+            "Return strict JSON with key 'raw_content' containing the transcription."
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ]
+        result = self.json_request(messages, max_tokens=6000, timeout=240)
+        if not result:
+            return None
+        text = result.get("raw_content")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+        return None
+
 def extract_receipt_payload_from_image(
     source_path: str,
     *,
     model_name: str = "gpt-5-mini",
     script_dir: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    # Dispatch based on backend
-    backend = BACKEND
+    # Dispatch based on backend (env can override module default)
+    backend = (os.getenv("PRODUCTDB_BACKEND") or BACKEND).strip().lower()
     if backend not in {"openai", "ollama", "openrouter"}:
         LOG.warning("Unknown PRODUCTDB_BACKEND=%r; defaulting to 'openai'", backend)
         backend = "openai"
@@ -189,8 +691,9 @@ def extract_receipt_payload_from_image(
         return _extract_with_ollama(source_path, script_dir=script_dir, model_tag=MODEL)
     if backend == "openrouter":
         LOG.info("Backend selected: OpenRouter")
-        LOG.debug("Effective OpenRouter model: %s", OPENROUTER_MODEL)
-        return _extract_with_openrouter(source_path, script_dir=script_dir, model_name=OPENROUTER_MODEL)
+        effective_model = (os.getenv("OPENROUTER_MODEL") or OPENROUTER_MODEL).strip()
+        LOG.debug("Effective OpenRouter model: %s", effective_model)
+        return _extract_with_openrouter(source_path, script_dir=script_dir, model_name=effective_model)
 
     # OpenAI path below
     api_key = load_openai(script_dir or os.getcwd())
@@ -430,7 +933,7 @@ def _extract_with_ollama(
     """
     # Resolve Ollama connection and model
     url_from_env, model_from_env = load_ollama(script_dir or os.getcwd())
-    chosen_model = (model_tag or model_from_env or "gemma3:4b").strip()
+    chosen_model = (model_from_env or model_tag or "gemma3:4b").strip()
 
     base = (url_from_env or "http://localhost:11434").strip()
     chat_endpoint = base if base.endswith("/api/chat") else base.rstrip("/") + "/api/chat"
@@ -691,18 +1194,17 @@ def _extract_with_openrouter(
         LOG.error("OPEN_ROUTER_API_KEY missing in env/.env; cannot run extraction")
         return None
 
+    effective_model = (model_name or "").strip()
+    if not effective_model:
+        LOG.error("No OpenRouter model configured via OPENROUTER_MODEL or parameter.")
+        return None
+
     data_url = _b64_data_url(source_path)
     if not data_url:
         return None
 
-    facts = _file_facts(source_path)
+    facts = FileFacts.from_dict(_file_facts(source_path))
     prompt = _prompt()
-
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
     messages = [
         {
             "role": "user",
@@ -712,65 +1214,85 @@ def _extract_with_openrouter(
             ],
         }
     ]
-    payload = {
-        "model": model_name,
-        "messages": messages,
-        "temperature": 0,
-        "max_tokens": 8000,
+
+    config = OpenRouterConfig(api_key=api_key, model_name=effective_model)
+    client = OpenRouterClient(config)
+
+    LOG.info("Calling OpenRouter model=%s for structured extraction", effective_model)
+    parsed = client.json_request(messages, max_tokens=8000, timeout=180)
+    if not isinstance(parsed, dict) or not parsed:
+        LOG.error("OpenRouter returned no valid JSON for structured extraction.")
+        return None
+
+    normalized = _normalize_openrouter_payload(parsed, facts=facts)
+
+    address = (normalized.get("merchant") or {}).get("address") or {}
+    context_for_country = {
+        "merchant": normalized.get("merchant"),
+        "currency": normalized.get("currency"),
+        "city": address.get("city"),
+        "postal_code": address.get("postal_code"),
     }
 
-    text = None
+    enrichment = normalized.setdefault("_enrichment", {})
+
+    if not address.get("country"):
+        LOG.info("Country missing; invoking OpenRouter guess helper.")
+        guessed_country = client.guess_country(data_url, context_for_country)
+        if guessed_country:
+            address["country"] = guessed_country
+        enrichment["guessed_country"] = guessed_country
+
+    if not normalized.get("raw_content"):
+        LOG.info("raw_content missing; requesting transcription via OpenRouter.")
+        raw_text = client.fetch_raw_content(data_url)
+        if raw_text:
+            normalized["raw_content"] = raw_text
+        enrichment["raw_content_fetched"] = bool(raw_text)
+
+    normalized.setdefault(
+        "_extraction_meta",
+        {
+            "model": effective_model,
+            "at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "backend": "openrouter",
+        },
+    )
+
+    LOG.info("OpenRouter extraction parsed and enriched successfully.")
+    return normalized
+
+
+# ------------------------------ SELF-RUNNER ------------------------------
+if __name__ == "__main__":
+    """Very simple direct runner for OpenRouter.
+
+    - Hardcoded image path is used if no CLI arg is provided.
+    - Reads API key and optional model from .env via config loaders.
+    - Prints the parsed JSON result; minimal logging.
+    """
+    # Hardcoded default; replace with your path if desired
+    HARD_CODED_IMAGE = r"C:\\Users\\Anwender\\iCloudDrive\\Documents\\Scans\\1970-01-01_familia_betreff_1.jpeg"
+
+    img = sys.argv[1] if len(sys.argv) > 1 else HARD_CODED_IMAGE
+    if not os.path.isfile(img):
+        print(f"Image not found: {img}")
+        sys.exit(2)
+
+    # Keep logs quiet
     try:
-        LOG.info("Calling OpenRouter (requests) model=%s endpoint=%s", model_name, url)
-        resp = requests.post(url, headers=headers, json=payload, timeout=180)
-        if resp.status_code >= 400:
-            LOG.error("OpenRouter HTTP %s: %s", resp.status_code, resp.text[:500])
-            return None
-        body = resp.json()
-        choices = body.get("choices") or []
-        if choices:
-            msg = (choices[0].get("message") or {})
-            text = msg.get("content")
-            print(json.dumps(text, indent=4))
-    except Exception as e:
-        LOG.error("OpenRouter request failed: %s", e)
-        return None
+        import logging as _logging
+        _logging.getLogger("productdb-extraction").setLevel(_logging.ERROR)
+    except Exception:
+        pass
 
-    def _scavenge_json(s: str) -> Optional[Dict[str, Any]]:
-        if not s:
-            return None
-        start = s.find("{")
-        end = s.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            return None
-        for j in range(end, start, -1):
-            try:
-                return json.loads(s[start:j + 1])
-            except Exception:
-                continue
-        return None
+    # Force OpenRouter backend unless already set
+    os.environ.setdefault("PRODUCTDB_BACKEND", "openrouter")
+    model = (os.getenv("OPENROUTER_MODEL") or OPENROUTER_MODEL).strip()
 
-    parsed = None
-    if text:
-        try:
-            parsed = json.loads(text)
-        except Exception:
-            parsed = _scavenge_json(text)
-            if parsed is None:
-                LOG.error("OpenRouter output not valid JSON; first 500 chars: %r", (text[:500] if isinstance(text, str) else text))
-
-    if isinstance(parsed, dict) and parsed:
-        parsed.setdefault("source_file", facts)
-        parsed.setdefault(
-            "_extraction_meta",
-            {
-                "model": model_name,
-                "at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                "backend": "openrouter",
-            },
-        )
-        LOG.info("OpenRouter extraction parsed successfully.")
-        return parsed
-
-    LOG.error("OpenRouter returned no valid JSON.")
-    return None
+    # Call OpenRouter backend directly to avoid extra layers
+    result = _extract_with_openrouter(img, script_dir=os.getcwd(), model_name=model)
+    if not result:
+        sys.exit(1)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    sys.exit(0)

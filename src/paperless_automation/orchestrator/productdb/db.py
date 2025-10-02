@@ -100,14 +100,6 @@ CREATE TABLE IF NOT EXISTS extraction_runs (
   notes          TEXT
 );
 
--- 6) VAT lookup (optional)
-CREATE TABLE IF NOT EXISTS tax_rates (
-  tax_code    TEXT PRIMARY KEY,  -- "DE_7","DE_19"
-  country     TEXT NOT NULL,
-  rate        REAL NOT NULL,     -- 0.07, 0.19, etc.
-  description TEXT
-);
-
 -- Helpful indexes
 CREATE INDEX IF NOT EXISTS idx_receipts_merchant_dt ON receipts(merchant_id, purchase_date_time);
 CREATE INDEX IF NOT EXISTS idx_items_receipt        ON receipt_items(receipt_id);
