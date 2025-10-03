@@ -104,14 +104,6 @@ CREATE TABLE extraction_runs (
   notes          TEXT
 );
 
--- 6) VAT lookup (optional)
-CREATE TABLE tax_rates (
-  tax_code   TEXT PRIMARY KEY,  -- "DE_7","DE_19"
-  country    TEXT NOT NULL,
-  rate       REAL NOT NULL,     -- 0.07, 0.19, etc.
-  description TEXT
-);
-
 -- Helpful indexes
 CREATE INDEX idx_receipts_merchant_dt ON receipts(merchant_id, purchase_date_time);
 CREATE INDEX idx_items_receipt        ON receipt_items(receipt_id);
@@ -189,13 +181,6 @@ erDiagram
         INTEGER raw_content_id FK
         TEXT notes
     }
-    
-    TAX_RATES {
-        TEXT tax_code PK
-        TEXT country
-        REAL rate
-        TEXT description
-    }
 
     %% Relationships
     ADDRESSES ||--o{ MERCHANTS : "has"
@@ -205,7 +190,6 @@ erDiagram
     FILES ||--o{ RECEIPTS : "sources"
     TEXTS ||--o{ RECEIPTS : "raw_content"
     TEXTS ||--o{ EXTRACTION_RUNS : "raw_output"
-    TAX_RATES }o--|| RECEIPT_ITEMS : "defines_rate" 
 ```
 
 ## Workflow
