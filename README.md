@@ -38,12 +38,34 @@ python -m pip install -r requirements.txt
 1. `$env:PYTHONPATH = "$PWD\src"`
 2. `python -m paperless_automation productdb init`
 
+### Product DB dashboard
+
+Run the API + frontend server (serves on http://localhost:8001 by default):
+
+```powershell
+python -m paperless_automation productdb serve --host 127.0.0.1 --port 8001
+```
+
+The command starts a Starlette API and, if a frontend build exists, serves the React dashboard.
+
+To work on the React app:
+
+```powershell
+cd frontend/productdb-ui
+npm install
+npm run dev          # launches Vite dev server (http://localhost:5173)
+npm run build        # builds to frontend/productdb-ui/dist for the Python server
+```
+
+During development, Vite proxies `/api` calls to the Python server at `http://localhost:8001`.
+Set `VITE_API_BASE_URL` to override the API endpoint when needed.
+
 ## Running 
 
 Note: Make sure to run in powershell. Run the python command in project root.
 
 1. `$env:PYTHONPATH = "$PWD\src"`
-2. `python -m paperless_automation flow`
+2. `python -m paperless_automation watch` or `python -m paperless_automation flow`
 
 ## Configuration
 

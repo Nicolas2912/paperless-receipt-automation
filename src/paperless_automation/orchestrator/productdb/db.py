@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from contextlib import contextmanager
-from typing import Iterator, Optional, Dict, Any, List
+from typing import Iterator, Optional, Dict, Any, List, Sequence, Tuple
 
 from ...logging import get_logger
 from ...paths import find_project_root, var_dir
@@ -136,6 +136,7 @@ class ProductDatabase:
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
         try:
             yield conn
         finally:
@@ -373,3 +374,288 @@ class ProductDatabase:
             row = cur.fetchone()
             conn.commit()
             return int(row[0])
+
+    # --------------- Query helpers ---------------
+    @staticmethod
+    def _rows_to_dicts(rows: Sequence[sqlite3.Row]) -> List[Dict[str, Any]]:
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _row_to_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+        return dict(row) if row is not None else None
+
+    def fetch_summary(self) -> Dict[str, Any]:
+        """Return high-level counts and total amounts for dashboard views."""
+        with self.connect() as conn:
+            cur = conn.cursor()
+            table_counts: Dict[str, int] = {}
+            for table in (
+                "addresses",
+                "merchants",
+                "files",
+                "texts",
+                "receipts",
+                "receipt_items",
+                "extraction_runs",
+            ):
+                cur.execute(f"SELECT COUNT(*) AS count FROM {table};")
+                table_counts[table] = int(cur.fetchone()["count"])
+
+            cur.execute(
+                """
+                SELECT
+                    COALESCE(SUM(total_net), 0) AS total_net,
+                    COALESCE(SUM(total_tax), 0) AS total_tax,
+                    COALESCE(SUM(total_gross), 0) AS total_gross
+                FROM receipts;
+                """
+            )
+            totals_row = cur.fetchone()
+            totals = {
+                "total_net_cents": int(totals_row["total_net"] or 0),
+                "total_tax_cents": int(totals_row["total_tax"] or 0),
+                "total_gross_cents": int(totals_row["total_gross"] or 0),
+            }
+
+            cur.execute(
+                """
+                SELECT
+                    MIN(purchase_date_time) AS first_purchase,
+                    MAX(purchase_date_time) AS last_purchase
+                FROM receipts;
+                """
+            )
+            span_row = cur.fetchone()
+
+            return {
+                "counts": table_counts,
+                "totals": totals,
+                "timespan": {
+                    "first_purchase": span_row["first_purchase"],
+                    "last_purchase": span_row["last_purchase"],
+                },
+            }
+
+    def fetch_receipts_overview(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        search: Optional[str] = None,
+        merchant_id: Optional[int] = None,
+        sort: str = "purchase_date_time",
+        direction: str = "desc",
+    ) -> Dict[str, Any]:
+        """Return paginated receipt rows joined with merchant/address details."""
+        sort_map = {
+            "purchase_date_time": "r.purchase_date_time",
+            "total_gross": "r.total_gross",
+            "merchant": "m.name",
+            "item_count": "item_count",
+        }
+        sort_key = sort_map.get(sort, "r.purchase_date_time")
+        sort_dir = "DESC" if str(direction).lower() != "asc" else "ASC"
+
+        where_clauses: List[str] = []
+        params: List[Any] = []
+        if merchant_id is not None:
+            where_clauses.append("r.merchant_id = ?")
+            params.append(int(merchant_id))
+        if search:
+            like = f"%{search.lower()}%"
+            where_clauses.append(
+                "(LOWER(m.name) LIKE ? OR LOWER(r.purchase_date_time) LIKE ? OR LOWER(r.currency) LIKE ? OR LOWER(r.payment_method) LIKE ?)"
+            )
+            params.extend([like, like, like, like])
+
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+        base_query = f"""
+            SELECT
+                r.receipt_id,
+                r.purchase_date_time,
+                r.currency,
+                r.payment_method,
+                r.total_net,
+                r.total_tax,
+                r.total_gross,
+                r.merchant_id,
+                m.name AS merchant_name,
+                a.city AS merchant_city,
+                a.country AS merchant_country,
+                COALESCE(items.item_count, 0) AS item_count
+            FROM receipts r
+            JOIN merchants m ON m.merchant_id = r.merchant_id
+            LEFT JOIN addresses a ON a.address_id = m.address_id
+            LEFT JOIN (
+                SELECT receipt_id, COUNT(*) AS item_count
+                FROM receipt_items
+                GROUP BY receipt_id
+            ) AS items ON items.receipt_id = r.receipt_id
+            {where_sql}
+            ORDER BY {sort_key} {sort_dir}, r.receipt_id DESC
+            LIMIT ? OFFSET ?;
+        """
+
+        with self.connect() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"SELECT COUNT(*) AS total FROM receipts r JOIN merchants m ON m.merchant_id = r.merchant_id {where_sql};",
+                params,
+            )
+            total = int(cur.fetchone()["total"])
+
+            cur.execute(base_query, (*params, int(limit), int(offset)))
+            rows = self._rows_to_dicts(cur.fetchall())
+
+        return {"total": total, "items": rows, "limit": limit, "offset": offset}
+
+    def fetch_receipt_detail(self, receipt_id: int) -> Optional[Dict[str, Any]]:
+        """Return detailed receipt information with related entities."""
+        with self.connect() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT
+                    r.receipt_id,
+                    r.purchase_date_time,
+                    r.currency,
+                    r.payment_method,
+                    r.total_net,
+                    r.total_tax,
+                    r.total_gross,
+                    r.source_file_id,
+                    r.raw_content_id,
+                    r.created_at,
+                    m.merchant_id,
+                    m.name AS merchant_name,
+                    a.address_id,
+                    a.street,
+                    a.city,
+                    a.postal_code,
+                    a.country,
+                    f.file_id,
+                    f.filename,
+                    f.mime_type,
+                    f.byte_size,
+                    f.sha256
+                FROM receipts r
+                JOIN merchants m ON m.merchant_id = r.merchant_id
+                LEFT JOIN addresses a ON a.address_id = m.address_id
+                LEFT JOIN files f ON f.file_id = r.source_file_id
+                WHERE r.receipt_id = ?;
+                """,
+                (int(receipt_id),),
+            )
+            receipt = self._row_to_dict(cur.fetchone())
+            if receipt is None:
+                return None
+
+            cur.execute(
+                """
+                SELECT
+                    item_id,
+                    product_name,
+                    quantity,
+                    unit,
+                    unit_price_net,
+                    unit_price_gross,
+                    tax_rate,
+                    line_net,
+                    line_tax,
+                    line_gross,
+                    created_at
+                FROM receipt_items
+                WHERE receipt_id = ?
+                ORDER BY item_id ASC;
+                """,
+                (receipt_id,),
+            )
+            items = self._rows_to_dicts(cur.fetchall())
+
+            cur.execute(
+                """
+                SELECT
+                    run_id,
+                    model_name,
+                    started_at,
+                    finished_at,
+                    status,
+                    raw_content_id,
+                    notes
+                FROM extraction_runs
+                WHERE receipt_id = ?
+                ORDER BY run_id DESC;
+                """,
+                (receipt_id,),
+            )
+            runs = self._rows_to_dicts(cur.fetchall())
+
+            raw_content_id = receipt.get("raw_content_id")
+            raw_text: Optional[str] = None
+            if raw_content_id:
+                cur.execute("SELECT content FROM texts WHERE text_id = ?;", (raw_content_id,))
+                row = cur.fetchone()
+                if row:
+                    raw_text = row["content"]
+
+            receipt.update({"items": items, "extraction_runs": runs, "raw_content": raw_text})
+            return receipt
+
+    def fetch_merchants_overview(self) -> List[Dict[str, Any]]:
+        """Return merchants with aggregated spend and receipt count."""
+        with self.connect() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT
+                    m.merchant_id,
+                    m.name AS merchant_name,
+                    m.created_at,
+                    m.address_id,
+                    a.city,
+                    a.country,
+                    COUNT(r.receipt_id) AS receipt_count,
+                    COALESCE(SUM(r.total_gross), 0) AS total_gross_cents
+                FROM merchants m
+                LEFT JOIN addresses a ON a.address_id = m.address_id
+                LEFT JOIN receipts r ON r.merchant_id = m.merchant_id
+                GROUP BY m.merchant_id
+                ORDER BY receipt_count DESC, m.name ASC;
+                """
+            )
+            return self._rows_to_dicts(cur.fetchall())
+
+    def fetch_table_rows(
+        self,
+        table: str,
+        *,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        """Fetch raw table rows for the supported schema tables."""
+        allowed: Dict[str, Tuple[str, str]] = {
+            "addresses": ("addresses", "address_id"),
+            "merchants": ("merchants", "merchant_id"),
+            "files": ("files", "file_id"),
+            "texts": ("texts", "text_id"),
+            "receipts": ("receipts", "receipt_id"),
+            "receipt_items": ("receipt_items", "item_id"),
+            "extraction_runs": ("extraction_runs", "run_id"),
+        }
+        if table not in allowed:
+            raise ValueError(f"Unsupported table: {table}")
+
+        table_name, pk = allowed[table]
+        with self.connect() as conn:
+            cur = conn.cursor()
+            cur.execute(f"SELECT COUNT(*) AS total FROM {table_name};")
+            total = int(cur.fetchone()["total"])
+
+            cur.execute(
+                f"SELECT * FROM {table_name} ORDER BY {pk} DESC LIMIT ? OFFSET ?;",
+                (int(limit), int(offset)),
+            )
+            rows = self._rows_to_dicts(cur.fetchall())
+
+        return {"total": total, "items": rows, "limit": limit, "offset": offset}

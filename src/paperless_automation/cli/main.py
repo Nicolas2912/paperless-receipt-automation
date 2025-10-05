@@ -265,6 +265,49 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     pdb_extract.set_defaults(handler=_pdb_extract)
 
+    pdb_serve = pdb_sub.add_parser(
+        "serve",
+        help="Run the product DB API and optional React frontend server.",
+    )
+    pdb_serve.add_argument("--host", default="127.0.0.1")
+    pdb_serve.add_argument("--port", type=int, default=8001)
+    pdb_serve.add_argument("--reload", action="store_true", help="Enable auto-reload (development only)")
+    pdb_serve.add_argument("--log-level", default="info")
+    pdb_serve.add_argument("--static-dir", help="Override static frontend directory relative to project root")
+    pdb_serve.add_argument("--api-only", action="store_true", help="Serve JSON API without static frontend")
+    pdb_serve.add_argument(
+        "--allow-origin",
+        action="append",
+        dest="allow_origins",
+        help="Allowed CORS origin (can be provided multiple times, use '*' for any).",
+    )
+
+    def _pdb_serve(ns: argparse.Namespace) -> int:
+        from ..orchestrator.productdb.frontend import create_app
+        import uvicorn
+
+        allow_origins = ns.allow_origins
+        if allow_origins and len(allow_origins) == 1 and allow_origins[0] == "*":
+            allow_origins = ["*"]
+
+        app = create_app(
+            root_dir=os.getcwd(),
+            static_dir=ns.static_dir,
+            allow_origins=allow_origins,
+            serve_static=not ns.api_only,
+        )
+
+        uvicorn.run(
+            app,
+            host=ns.host,
+            port=ns.port,
+            reload=ns.reload,
+            log_level=ns.log_level,
+        )
+        return 0
+
+    pdb_serve.set_defaults(handler=_pdb_serve)
+
     args = parser.parse_args(provided)
     code = args.handler(args)
     LOG.info(f"Subcommand '{args.command}' finished with exit code {code}.")

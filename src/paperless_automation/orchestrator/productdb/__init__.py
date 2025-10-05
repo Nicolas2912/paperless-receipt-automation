@@ -14,9 +14,10 @@ Modules:
 
 from .db import ProductDatabase
 from .service import ReceiptExtractionService
+from .frontend.app import create_app
 
 __all__ = [
     "ProductDatabase",
     "ReceiptExtractionService",
+    "create_app",
 ]
-
