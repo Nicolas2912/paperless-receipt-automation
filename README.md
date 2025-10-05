@@ -33,6 +33,18 @@ conda activate paperless
 python -m pip install -r requirements.txt
 ```
 
+## Initialize productdb
+
+1. `$env:PYTHONPATH = "$PWD\src"`
+2. `python -m paperless_automation productdb init`
+
+## Running 
+
+Note: Make sure to run in powershell. Run the python command in project root.
+
+1. `$env:PYTHONPATH = "$PWD\src"`
+2. `python -m paperless_automation flow`
+
 ## Configuration
 
 - `.env` in the repo root (or an ancestor of your CWD):

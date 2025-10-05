@@ -207,11 +207,11 @@ class ReceiptFlow:
                 break
 
         if not source_path:
-            LOG.warning("Skipping product DB extraction; no accessible image path found")
+            LOG.warning("Skipping product DB extraction; no accessible source path found")
             _cleanup(preserved_path)
             return
 
-        LOG.info(f"Running product DB extraction for image: {source_path}")
+        LOG.info(f"Running product DB extraction for source: {source_path}")
         try:
             summary = service.run_and_persist(
                 source_path,
@@ -380,6 +380,12 @@ class ReceiptFlow:
             upload_title=result.title,
             upload_doc_id=result.doc_id,
             original_filename=result.original_filename,
+        )
+
+        self._run_productdb_pipeline(
+            original_path=pdf_path,
+            active_path=new_pdf_path,
+            preserved_path=None,
         )
 
         return new_pdf_path

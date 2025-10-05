@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -83,6 +84,15 @@ def _extract_doc_id(response: Dict[str, Any]) -> Optional[int]:
     return None
 
 
+def _extract_task_id(response: Dict[str, Any]) -> Optional[int]:
+    body = response.get("json") if isinstance(response, dict) else None
+    if isinstance(body, dict):
+        task_id = body.get("task_id") or body.get("task")
+        if isinstance(task_id, int):
+            return task_id
+    return None
+
+
 def upload_pdf_document(
     pdf_path: str,
     *,
@@ -108,17 +118,80 @@ def upload_pdf_document(
     )
 
     doc_id = _extract_doc_id(response)
+    task_id = _extract_task_id(response)
 
     if doc_id is None and fields.get("title"):
-        LOG.info("Document id not in response; searching by title")
-        doc_id = client.find_document_by_title(fields["title"])
+        attempts = 0
+        max_attempts = 10
+        wait_seconds = 1.5
+        LOG.info("Document id not in response; polling Paperless for document creation")
+        while attempts < max_attempts and not doc_id:
+            attempts += 1
+            if task_id:
+                LOG.debug(f"Polling attempt {attempts}/{max_attempts} (task_id={task_id})")
+            else:
+                LOG.debug(f"Polling attempt {attempts}/{max_attempts}")
+            time.sleep(wait_seconds)
+            doc_id = client.find_document_by_title(fields["title"])
         if doc_id:
-            LOG.info(f"Resolved document id by title search: {doc_id}")
+            LOG.info(f"Resolved document id after polling: {doc_id}")
         else:
-            LOG.warning("Still no document id after title search")
+            LOG.warning("Unable to resolve document id after polling")
+
+    if doc_id and task_id:
+        max_task_attempts = 20
+        LOG.info(f"Waiting for Paperless task {task_id} to finish before applying overrides")
+        for attempt in range(1, max_task_attempts + 1):
+            task = client.get_task(task_id)
+            status = (task or {}).get("status")
+            LOG.debug(
+                "Task %s status=%s (attempt %s/%s)",
+                task_id,
+                status,
+                attempt,
+                max_task_attempts,
+            )
+            if status in {"SUCCESS", "FAILURE", "REVOKED"}:
+                break
+            time.sleep(1.0)
+        else:
+            LOG.warning(f"Task {task_id} did not reach a terminal state before timeout")
 
     tag_ids = fields.get("tag_ids") or []
-    if doc_id and isinstance(tag_ids, list) and tag_ids:
+    if doc_id:
+        patch_payload: Dict[str, Any] = {}
+        if isinstance(tag_ids, list) and tag_ids:
+            dedup: List[int] = []
+            seen = set()
+            for tag_id in tag_ids:
+                if isinstance(tag_id, int) and tag_id not in seen:
+                    seen.add(tag_id)
+                    dedup.append(tag_id)
+            if dedup:
+                patch_payload["tags"] = dedup
+                LOG.info(f"Preparing to enforce exact tag set {dedup} on document {doc_id}")
+
+        if isinstance(fields.get("correspondent_id"), int):
+            patch_payload["correspondent"] = int(fields["correspondent_id"])
+        if isinstance(fields.get("document_type_id"), int):
+            patch_payload["document_type"] = int(fields["document_type_id"])
+        if fields.get("created"):
+            patch_payload["created"] = fields["created"]
+        if fields.get("title"):
+            patch_payload["title"] = fields["title"]
+
+        if patch_payload:
+            LOG.info(f"Patching document {doc_id} with extracted metadata: {list(patch_payload.keys())}")
+            client.patch_document(doc_id, patch_payload)
+            doc_preview = client.get_document(doc_id) or {}
+            LOG.debug(
+                "Document %s after patch => correspondent=%s tags=%s document_type=%s",
+                doc_id,
+                doc_preview.get("correspondent"),
+                doc_preview.get("tags"),
+                doc_preview.get("document_type"),
+            )
+    elif isinstance(tag_ids, list) and tag_ids:
         dedup: List[int] = []
         seen = set()
         for tag_id in tag_ids:
@@ -126,8 +199,7 @@ def upload_pdf_document(
                 seen.add(tag_id)
                 dedup.append(tag_id)
         if dedup:
-            LOG.info(f"Enforcing exact tag set {dedup} on document {doc_id}")
-            client.patch_document(doc_id, {"tags": dedup})
+            LOG.warning(f"Could not enforce tag ids {dedup}; no document id available")
 
     original_filename = os.path.basename(pdf_path)
     return UploadResult(

@@ -96,7 +96,6 @@ CREATE TABLE extraction_runs (
   run_id         INTEGER PRIMARY KEY,
   receipt_id     INTEGER REFERENCES receipts(receipt_id) ON DELETE CASCADE,
   model_name     TEXT NOT NULL,
-  prompt_version TEXT,
   started_at     TEXT DEFAULT (datetime('now')),
   finished_at    TEXT,
   status         TEXT CHECK (status IN ('OK','WARN','ERROR')) DEFAULT 'OK',
@@ -174,7 +173,6 @@ erDiagram
         INTEGER run_id PK
         INTEGER receipt_id FK
         TEXT model_name
-        TEXT prompt_version
         TEXT started_at
         TEXT finished_at
         TEXT status

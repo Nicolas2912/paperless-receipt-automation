@@ -28,7 +28,11 @@ class ReceiptExtractionService:
         return self.db.db_path
 
     def extract_from_image(self, source_path: str, *, model_name: str = "gpt-5-mini", script_dir: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """Run LLM extraction then validate JSON payload (no DB writes)."""
+        """Run LLM extraction then validate JSON payload (no DB writes).
+
+        Note: despite the name, PDF sources are also supported when using the
+        OpenRouter backend.
+        """
         payload = extract_receipt_payload_from_image(source_path, model_name=model_name, script_dir=script_dir)
         if payload is None:
             LOG.warning("No extraction payload produced (stub).")
@@ -91,11 +95,20 @@ class ReceiptExtractionService:
         item_count = self.db.insert_items(receipt_id, items)
 
         # Extraction run record
+        extraction_meta = payload.get("_extraction_meta")
+        extracted_model_name: Optional[str] = None
+        if isinstance(extraction_meta, dict):
+            maybe_model = extraction_meta.get("model")
+            if isinstance(maybe_model, str) and maybe_model.strip():
+                extracted_model_name = maybe_model.strip()
+
+        fallback_model = model_name if isinstance(model_name, str) and model_name.strip() else "unknown"
+        final_model_name = extracted_model_name or fallback_model
+
         run_id = self.db.insert_extraction_run(
             {
                 "receipt_id": receipt_id,
-                "model_name": model_name,
-                "prompt_version": "v1",
+                "model_name": final_model_name,
                 "status": "OK",
                 "raw_content_id": raw_json_id,
                 "notes": None,
@@ -112,6 +125,7 @@ class ReceiptExtractionService:
             "extraction_run_id": run_id,
             "raw_payload_text_id": raw_json_id,
             "raw_text_id": raw_text_id,
+            "model_name": final_model_name,
         }
         LOG.info("Persisted extraction: %s", summary)
         return summary

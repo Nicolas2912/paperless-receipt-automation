@@ -108,7 +108,24 @@ class PaperlessClient:
         return None
 
     # ---------- tasks ----------
-    # Note: get_document and find_task_by_uuid removed as unused helpers.
+    def get_task(self, task_id: int) -> Optional[Dict[str, Any]]:
+        url = self._url(f"/api/tasks/{int(task_id)}/")
+        try:
+            r = self.s.get(url, timeout=self.timeout, verify=self.verify)
+            return self._json(r)
+        except Exception as e:
+            self.log.warning(f"get_task {task_id} failed: {e}")
+            return None
+
+    # ---------- documents (read-only helpers) ----------
+    def get_document(self, doc_id: int) -> Optional[Dict[str, Any]]:
+        url = self._url(f"/api/documents/{int(doc_id)}/")
+        try:
+            r = self.s.get(url, timeout=self.timeout, verify=self.verify)
+            return self._json(r)
+        except Exception as e:
+            self.log.warning(f"get_document {doc_id} failed: {e}")
+            return None
 
     # ---------- resources (by name) ----------
     def _get_first_by_name(self, resource: str, name: str) -> Optional[Dict[str, Any]]:

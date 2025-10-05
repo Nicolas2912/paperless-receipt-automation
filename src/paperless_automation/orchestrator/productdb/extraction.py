@@ -39,14 +39,27 @@ OPENROUTER_MODEL: str = (os.getenv("OPENROUTER_MODEL"))
 if OPENROUTER_MODEL:
     LOG.debug("Configured OpenRouter model: %s", OPENROUTER_MODEL)
 
+_OPENROUTER_PDF_ENGINE_ENV = os.getenv("OPENROUTER_PDF_ENGINE")
+if _OPENROUTER_PDF_ENGINE_ENV is not None:
+    OPENROUTER_PDF_ENGINE = _OPENROUTER_PDF_ENGINE_ENV.strip()
+    if OPENROUTER_PDF_ENGINE:
+        LOG.debug("Configured OpenRouter PDF engine: %s", OPENROUTER_PDF_ENGINE)
+else:
+    OPENROUTER_PDF_ENGINE = "pdf-text"
+
 # ---------- file helpers (unchanged) ----------
 def _b64_data_url(path: str) -> Optional[str]:
     mime, _ = mimetypes.guess_type(path)
     if not mime:
         ext = os.path.splitext(path)[1].lower()
-        mime = "image/jpeg" if ext in {".jpg", ".jpeg", ".jpe", ".jfif"} else "image/png"
-    if not mime or not mime.startswith("image/"):
-        LOG.error("Unsupported MIME type for vision extraction: %s", mime)
+        if ext == ".pdf":
+            mime = "application/pdf"
+        elif ext in {".jpg", ".jpeg", ".jpe", ".jfif"}:
+            mime = "image/jpeg"
+        else:
+            mime = "image/png"
+    if not mime or (not mime.startswith("image/") and mime != "application/pdf"):
+        LOG.error("Unsupported MIME type for extraction: %s", mime)
         return None
     try:
         with open(path, "rb") as f:
@@ -103,6 +116,39 @@ class FileFacts:
             "byte_size": self.byte_size,
             "sha256": self.sha256,
         }
+
+
+def _openrouter_content_node(data_url: str, facts: FileFacts) -> Dict[str, Any]:
+    mime = (facts.mime_type or "").lower()
+    if mime.startswith("image/"):
+        return {"type": "image_url", "image_url": {"url": data_url}}
+    filename = facts.filename or "document.pdf"
+    return {
+        "type": "file",
+        "file": {
+            "filename": filename,
+            "file_data": data_url,
+        },
+    }
+
+
+def _openrouter_plugins_for_mime(mime: Optional[str]) -> Optional[List[Dict[str, Any]]]:
+    if not mime:
+        return None
+    normalized = mime.lower()
+    if normalized != "application/pdf":
+        return None
+    engine = OPENROUTER_PDF_ENGINE.strip()
+    if not engine or engine.lower() in {"default", "none", "off"}:
+        return None
+    return [
+        {
+            "id": "file-parser",
+            "pdf": {
+                "engine": engine,
+            },
+        }
+    ]
 
 
 @dataclass(frozen=True)
@@ -571,6 +617,7 @@ class OpenRouterClient:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout: Optional[int] = None,
+        plugins: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[str]:
         payload = {
             "model": self.config.model_name,
@@ -578,6 +625,8 @@ class OpenRouterClient:
             "temperature": self.config.temperature if temperature is None else temperature,
             "max_tokens": self.config.max_tokens if max_tokens is None else max_tokens,
         }
+        if plugins:
+            payload["plugins"] = plugins
         headers = {
             "Authorization": f"Bearer {self.config.api_key}",
             "Content-Type": "application/json",
@@ -612,12 +661,14 @@ class OpenRouterClient:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout: Optional[int] = None,
+        plugins: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
         text = self.chat(
             messages,
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            plugins=plugins,
         )
         if not text:
             return None
@@ -627,23 +678,29 @@ class OpenRouterClient:
             return _scavenge_json_block(text)
 
     # ---- convenience helpers -----------------------------------------------------
-    def guess_country(self, data_url: str, context: Dict[str, Any]) -> Optional[str]:
+    def guess_country(self, data_url: str, context: Dict[str, Any], *, facts: FileFacts) -> Optional[str]:
         context_text = json.dumps(context, ensure_ascii=False)
         prompt = (
             "Estimate the likely ISO 3166-1 alpha-2 country code for the merchant on this retail receipt. "
             "Use signals such as language, city names, postal codes, addresses, currency symbols, and other hints. "
             "Return strict JSON with a single key 'country'."
         )
+        content_node = _openrouter_content_node(data_url, facts)
         messages = [
             {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": f"{prompt}\n\nStructured context:\n{context_text}"},
-                    {"type": "image_url", "image_url": {"url": data_url}},
+                    content_node,
                 ],
             }
         ]
-        result = self.json_request(messages, max_tokens=200, timeout=150)
+        result = self.json_request(
+            messages,
+            max_tokens=200,
+            timeout=150,
+            plugins=_openrouter_plugins_for_mime(facts.mime_type),
+        )
         if not result:
             return None
         country = result.get("country")
@@ -651,21 +708,27 @@ class OpenRouterClient:
             return country.strip().upper()
         return None
 
-    def fetch_raw_content(self, data_url: str) -> Optional[str]:
+    def fetch_raw_content(self, data_url: str, *, facts: FileFacts) -> Optional[str]:
         prompt = (
             "Transcribe the receipt exactly as text, preserving line order. "
             "Return strict JSON with key 'raw_content' containing the transcription."
         )
+        content_node = _openrouter_content_node(data_url, facts)
         messages = [
             {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": data_url}},
+                    content_node,
                 ],
             }
         ]
-        result = self.json_request(messages, max_tokens=6000, timeout=240)
+        result = self.json_request(
+            messages,
+            max_tokens=6000,
+            timeout=240,
+            plugins=_openrouter_plugins_for_mime(facts.mime_type),
+        )
         if not result:
             return None
         text = result.get("raw_content")
@@ -685,7 +748,13 @@ def extract_receipt_payload_from_image(
         LOG.warning("Unknown PRODUCTDB_BACKEND=%r; defaulting to 'openai'", backend)
         backend = "openai"
 
+    mime, _ = mimetypes.guess_type(source_path)
+    is_pdf = (mime == "application/pdf") or source_path.lower().endswith(".pdf")
+
     if backend == "ollama":
+        if is_pdf:
+            LOG.error("Ollama backend does not support PDF extraction yet; skipping %s", source_path)
+            return None
         LOG.info("Backend selected: Ollama")
         LOG.debug("Effective Ollama model: %s", MODEL)
         return _extract_with_ollama(source_path, script_dir=script_dir, model_tag=MODEL)
@@ -696,6 +765,9 @@ def extract_receipt_payload_from_image(
         return _extract_with_openrouter(source_path, script_dir=script_dir, model_name=effective_model)
 
     # OpenAI path below
+    if is_pdf:
+        LOG.error("OpenAI backend does not support PDF extraction in this workflow; skipping %s", source_path)
+        return None
     api_key = load_openai(script_dir or os.getcwd())
     if not api_key:
         LOG.error("OPENAI_API_KEY missing in env/.env; cannot run extraction")
@@ -1204,13 +1276,15 @@ def _extract_with_openrouter(
         return None
 
     facts = FileFacts.from_dict(_file_facts(source_path))
+    content_node = _openrouter_content_node(data_url, facts)
+    plugins = _openrouter_plugins_for_mime(facts.mime_type)
     prompt = _prompt()
     messages = [
         {
             "role": "user",
             "content": [
                 {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": data_url}},
+                content_node,
             ],
         }
     ]
@@ -1219,7 +1293,12 @@ def _extract_with_openrouter(
     client = OpenRouterClient(config)
 
     LOG.info("Calling OpenRouter model=%s for structured extraction", effective_model)
-    parsed = client.json_request(messages, max_tokens=8000, timeout=180)
+    parsed = client.json_request(
+        messages,
+        max_tokens=8000,
+        timeout=180,
+        plugins=plugins,
+    )
     if not isinstance(parsed, dict) or not parsed:
         LOG.error("OpenRouter returned no valid JSON for structured extraction.")
         return None
@@ -1238,14 +1317,18 @@ def _extract_with_openrouter(
 
     if not address.get("country"):
         LOG.info("Country missing; invoking OpenRouter guess helper.")
-        guessed_country = client.guess_country(data_url, context_for_country)
+        guessed_country = client.guess_country(
+            data_url,
+            context_for_country,
+            facts=facts,
+        )
         if guessed_country:
             address["country"] = guessed_country
         enrichment["guessed_country"] = guessed_country
 
     if not normalized.get("raw_content"):
         LOG.info("raw_content missing; requesting transcription via OpenRouter.")
-        raw_text = client.fetch_raw_content(data_url)
+        raw_text = client.fetch_raw_content(data_url, facts=facts)
         if raw_text:
             normalized["raw_content"] = raw_text
         enrichment["raw_content_fetched"] = bool(raw_text)

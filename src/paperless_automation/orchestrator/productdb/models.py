@@ -72,7 +72,6 @@ class ExtractionRun:
     run_id: Optional[int]
     receipt_id: Optional[int]
     model_name: str
-    prompt_version: Optional[str]
     started_at: Optional[str]
     finished_at: Optional[str]
     status: Optional[str]
@@ -86,4 +85,3 @@ class TaxRate:
     country: str
     rate: float
     description: Optional[str]
-

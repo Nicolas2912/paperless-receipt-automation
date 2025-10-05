@@ -92,7 +92,6 @@ CREATE TABLE IF NOT EXISTS extraction_runs (
   run_id         INTEGER PRIMARY KEY,
   receipt_id     INTEGER REFERENCES receipts(receipt_id) ON DELETE CASCADE,
   model_name     TEXT NOT NULL,
-  prompt_version TEXT,
   started_at     TEXT DEFAULT (datetime('now')),
   finished_at    TEXT,
   status         TEXT CHECK (status IN ('OK','WARN','ERROR')) DEFAULT 'OK',
@@ -152,9 +151,79 @@ class ProductDatabase:
                 # Non-fatal; continue with schema creation
                 pass
             LOG.info("Ensuring product DB schema is present…")
+            self._migrate_extraction_runs_drop_prompt_version(conn)
             cur.executescript(SCHEMA_SQL)
             conn.commit()
             LOG.info("Product DB schema ensured.")
+
+    def _migrate_extraction_runs_drop_prompt_version(self, conn: sqlite3.Connection) -> None:
+        """Remove legacy prompt_version column if older schema is detected."""
+        cur = conn.cursor()
+        try:
+            cur.execute("PRAGMA table_info(extraction_runs);")
+        except sqlite3.OperationalError:
+            # Table does not exist yet; nothing to migrate.
+            return
+
+        columns = [row[1] for row in cur.fetchall()]
+        if "prompt_version" not in columns:
+            return
+
+        LOG.info("Migrating extraction_runs table to drop obsolete prompt_version column")
+        try:
+            conn.execute("PRAGMA foreign_keys=OFF;")
+            conn.execute("BEGIN IMMEDIATE;")
+            cur.execute("DROP TABLE IF EXISTS extraction_runs_new;")
+            cur.execute(
+                """
+                CREATE TABLE extraction_runs_new (
+                  run_id         INTEGER PRIMARY KEY,
+                  receipt_id     INTEGER REFERENCES receipts(receipt_id) ON DELETE CASCADE,
+                  model_name     TEXT NOT NULL,
+                  started_at     TEXT DEFAULT (datetime('now')),
+                  finished_at    TEXT,
+                  status         TEXT CHECK (status IN ('OK','WARN','ERROR')) DEFAULT 'OK',
+                  raw_content_id INTEGER REFERENCES texts(text_id) ON DELETE SET NULL,
+                  notes          TEXT
+                );
+                """
+            )
+            cur.execute(
+                """
+                INSERT INTO extraction_runs_new (
+                  run_id,
+                  receipt_id,
+                  model_name,
+                  started_at,
+                  finished_at,
+                  status,
+                  raw_content_id,
+                  notes
+                )
+                SELECT
+                  run_id,
+                  receipt_id,
+                  model_name,
+                  started_at,
+                  finished_at,
+                  status,
+                  raw_content_id,
+                  notes
+                FROM extraction_runs;
+                """
+            )
+            cur.execute("DROP TABLE extraction_runs;")
+            cur.execute("ALTER TABLE extraction_runs_new RENAME TO extraction_runs;")
+            conn.commit()
+        except Exception:
+            LOG.exception("Failed to migrate extraction_runs table; rolling back changes")
+            try:
+                conn.rollback()
+            except sqlite3.OperationalError:
+                pass
+            raise
+        finally:
+            conn.execute("PRAGMA foreign_keys=ON;")
 
     # --------------- Insert/Upsert helpers ---------------
     def insert_address(self, addr: Dict[str, Optional[str]]) -> int:
@@ -289,14 +358,13 @@ class ProductDatabase:
             cur.execute(
                 """
                 INSERT INTO extraction_runs (
-                    receipt_id, model_name, prompt_version, finished_at, status, raw_content_id, notes
-                ) VALUES (?, ?, ?, datetime('now'), ?, ?, ?)
+                    receipt_id, model_name, finished_at, status, raw_content_id, notes
+                ) VALUES (?, ?, datetime('now'), ?, ?, ?)
                 RETURNING run_id;
                 """,
                 (
                     run.get("receipt_id"),
                     run["model_name"],
-                    run.get("prompt_version"),
                     run.get("status", "OK"),
                     run.get("raw_content_id"),
                     run.get("notes"),

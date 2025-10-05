@@ -196,6 +196,9 @@ def parse_and_validate_payload(payload: Any) -> Dict[str, Any]:
     }
     if raw_content:
         normalized["raw_content"] = raw_content
+    extraction_meta = payload.get("_extraction_meta")
+    if isinstance(extraction_meta, dict) and extraction_meta:
+        normalized["_extraction_meta"] = dict(extraction_meta)
     enrichment = payload.get("_enrichment")
     if isinstance(enrichment, dict) and enrichment:
         normalized["_enrichment"] = enrichment
