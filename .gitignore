@@ -21,7 +21,9 @@ scan-image-path.txt
 *.pdf
 generated_pdfs/
 paperless_db/
-var/
+var/*
+!var/productdb/
+!var/productdb/**
 
 # Stray outputs if something was run from src/
 src/generated_pdfs/
