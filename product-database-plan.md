@@ -85,11 +85,12 @@ CREATE TABLE receipt_items (
   line_net         INTEGER,            -- cents
   line_tax         INTEGER,            -- cents
   line_gross       INTEGER,            -- cents
-  created_at       TEXT DEFAULT (datetime('now')),
-  CHECK(line_net    IS NULL OR line_net    >= 0),
-  CHECK(line_tax    IS NULL OR line_tax    >= 0),
-  CHECK(line_gross  IS NULL OR line_gross  >= 0)
+  line_type        TEXT NOT NULL DEFAULT 'SALE'
+                  CHECK(line_type IN ('SALE','DEPOSIT_CHARGE','DEPOSIT_REFUND','DISCOUNT','OTHER')),
+  created_at       TEXT DEFAULT (datetime('now'))
 );
+
+Line totals (`line_net`, `line_tax`, `line_gross`) are allowed to be negative so that Einweg-/Mehrweg-Pfand refunds or explicit discounts can be captured; use `line_type` to disambiguate these rows while still enforcing `quantity > 0`.
 
 -- 5) Extraction runs
 CREATE TABLE extraction_runs (

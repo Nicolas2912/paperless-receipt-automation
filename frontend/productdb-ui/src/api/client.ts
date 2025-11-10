@@ -51,6 +51,7 @@ export interface ReceiptItem {
   line_net: number | null;
   line_tax: number | null;
   line_gross: number | null;
+  line_type: string;
   created_at: string;
 }
 

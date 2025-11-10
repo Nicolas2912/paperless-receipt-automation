@@ -64,6 +64,7 @@ class ReceiptItem:
     line_net: Optional[int]
     line_tax: Optional[int]
     line_gross: Optional[int]
+    line_type: str
     created_at: Optional[str] = None
 
 

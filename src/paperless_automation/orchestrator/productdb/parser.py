@@ -4,6 +4,11 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime
 
 from ...logging import get_logger
+from .constants import (
+    LINE_TYPE_CHOICES,
+    LINE_TYPE_DEFAULT,
+    LINE_TYPE_DEPOSIT_REFUND,
+)
 
 
 LOG = get_logger("productdb-parser")
@@ -57,6 +62,13 @@ def parse_and_validate_payload(payload: Any) -> Dict[str, Any]:
             return float(v)
         except Exception:
             return default
+
+    def _normalize_line_type(value: Any) -> str:
+        if isinstance(value, str):
+            candidate = value.strip().upper()
+            if candidate in LINE_TYPE_CHOICES:
+                return candidate
+        return LINE_TYPE_DEFAULT
 
     # merchant
     m = payload.get("merchant")
@@ -143,6 +155,9 @@ def parse_and_validate_payload(payload: Any) -> Dict[str, Any]:
             net_values.append(int(ln))
         if lt is not None:
             tax_values.append(int(lt))
+        line_type = _normalize_line_type(it.get("line_type"))
+        if line_type == LINE_TYPE_DEFAULT and lg is not None and lg < 0:
+            line_type = LINE_TYPE_DEPOSIT_REFUND
         norm_items.append(
             {
                 "product_name": name,
@@ -154,6 +169,7 @@ def parse_and_validate_payload(payload: Any) -> Dict[str, Any]:
                 "line_net": ln,
                 "line_tax": lt,
                 "line_gross": lg,
+                "line_type": line_type,
             }
         )
 

@@ -46,6 +46,16 @@ Run the API + frontend server (serves on http://localhost:8001 by default):
 python -m paperless_automation productdb serve --host 127.0.0.1 --port 8001
 ```
 
+### Bulk ingest existing scans
+
+To populate the new product database with every receipt you already have in your scans folder, run:
+
+```powershell
+python -m paperless_automation productdb ingest
+```
+
+The command reads the folder pointed at by `scan-image-path.txt` (or use `--config-path` to override) and feeds each JPG/PNG/PDF into the extraction pipeline. Add `--recursive` to traverse subdirectories, pass `--model <tag>` to change the extraction model, or `--dry-run` to list files without writing to the DB.
+
 The command starts a Starlette API and, if a frontend build exists, serves the React dashboard.
 
 To work on the React app:

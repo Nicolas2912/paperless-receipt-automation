@@ -7,6 +7,7 @@ from typing import Iterator, Optional, Dict, Any, List, Sequence, Tuple
 
 from ...logging import get_logger
 from ...paths import find_project_root, var_dir
+from .constants import LINE_TYPE_CHOICES, LINE_TYPE_DEFAULT
 
 
 LOG = get_logger("productdb-db")
@@ -16,8 +17,10 @@ LOG = get_logger("productdb-db")
 DEFAULT_DB_FOLDER = "productdb"
 DEFAULT_DB_FILENAME = "products.sqlite3"
 
+LINE_TYPE_ENUM_SQL = ", ".join(f"'{value}'" for value in LINE_TYPE_CHOICES)
 
-SCHEMA_SQL = """
+
+SCHEMA_SQL = f"""
 PRAGMA foreign_keys = ON;
 
 -- 1) Address book
@@ -81,10 +84,9 @@ CREATE TABLE IF NOT EXISTS receipt_items (
   line_net          INTEGER,            -- cents
   line_tax          INTEGER,            -- cents
   line_gross        INTEGER,            -- cents
-  created_at        TEXT DEFAULT (datetime('now')),
-  CHECK(line_net    IS NULL OR line_net    >= 0),
-  CHECK(line_tax    IS NULL OR line_tax    >= 0),
-  CHECK(line_gross  IS NULL OR line_gross  >= 0)
+  line_type         TEXT NOT NULL DEFAULT '{LINE_TYPE_DEFAULT}'
+                   CHECK(line_type IN ({LINE_TYPE_ENUM_SQL})),
+  created_at        TEXT DEFAULT (datetime('now'))
 );
 
 -- 5) Extraction runs
@@ -153,6 +155,7 @@ class ProductDatabase:
                 pass
             LOG.info("Ensuring product DB schema is present…")
             self._migrate_extraction_runs_drop_prompt_version(conn)
+            self._migrate_receipt_items_line_types(conn)
             cur.executescript(SCHEMA_SQL)
             conn.commit()
             LOG.info("Product DB schema ensured.")
@@ -223,6 +226,98 @@ class ProductDatabase:
             except sqlite3.OperationalError:
                 pass
             raise
+        finally:
+            conn.execute("PRAGMA foreign_keys=ON;")
+
+    def _migrate_receipt_items_line_types(self, conn: sqlite3.Connection) -> None:
+        """Ensure receipt_items can store line_type and negative amounts."""
+        cur = conn.cursor()
+        try:
+            cur.execute("PRAGMA table_info(receipt_items);")
+        except sqlite3.OperationalError:
+            return
+
+        columns = [row[1] for row in cur.fetchall()]
+        if not columns:
+            return
+
+        cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='receipt_items';")
+        sql_row = cur.fetchone()
+        table_sql = (sql_row["sql"] or "") if sql_row and sql_row["sql"] else ""
+
+        has_line_type = "line_type" in columns
+        has_non_negative_checks = any(
+            check in table_sql for check in ("CHECK(line_net", "CHECK(line_tax", "CHECK(line_gross")
+        )
+        if has_line_type and not has_non_negative_checks:
+            return
+
+        LOG.info("Migrating receipt_items to add line_type and relax line amount checks")
+        select_line_type = "line_type" if has_line_type else f"'{LINE_TYPE_DEFAULT}'"
+        try:
+            conn.execute("PRAGMA foreign_keys=OFF;")
+            conn.execute("BEGIN IMMEDIATE;")
+            cur.execute("DROP TABLE IF EXISTS receipt_items_new;")
+            cur.execute(
+                f"""
+                CREATE TABLE receipt_items_new (
+                  item_id           INTEGER PRIMARY KEY,
+                  receipt_id        INTEGER NOT NULL REFERENCES receipts(receipt_id) ON DELETE CASCADE,
+                  product_name      TEXT NOT NULL,
+                  quantity          REAL NOT NULL CHECK(quantity > 0),
+                  unit              TEXT,
+                  unit_price_net    INTEGER,
+                  unit_price_gross  INTEGER,
+                  tax_rate          REAL NOT NULL CHECK(tax_rate IN (0.00, 0.07, 0.19)),
+                  line_net          INTEGER,
+                  line_tax          INTEGER,
+                  line_gross        INTEGER,
+                  line_type         TEXT NOT NULL DEFAULT '{LINE_TYPE_DEFAULT}'
+                                   CHECK(line_type IN ({LINE_TYPE_ENUM_SQL})),
+                  created_at        TEXT DEFAULT (datetime('now'))
+                );
+                """
+            )
+            cur.execute(
+                f"""
+                INSERT INTO receipt_items_new (
+                  item_id,
+                  receipt_id,
+                  product_name,
+                  quantity,
+                  unit,
+                  unit_price_net,
+                  unit_price_gross,
+                  tax_rate,
+                  line_net,
+                  line_tax,
+                  line_gross,
+                  line_type,
+                  created_at
+                )
+                SELECT
+                  item_id,
+                  receipt_id,
+                  product_name,
+                  quantity,
+                  unit,
+                  unit_price_net,
+                  unit_price_gross,
+                  tax_rate,
+                  line_net,
+                  line_tax,
+                  line_gross,
+                  {select_line_type} AS line_type,
+                  created_at
+                FROM receipt_items;
+                """
+            )
+            cur.execute("DROP TABLE receipt_items;")
+            cur.execute("ALTER TABLE receipt_items_new RENAME TO receipt_items;")
+            conn.commit()
+        except Exception:
+            LOG.exception("Failed to migrate receipt_items table; rolling back changes")
+            conn.rollback()
         finally:
             conn.execute("PRAGMA foreign_keys=ON;")
 
@@ -328,13 +423,16 @@ class ProductDatabase:
             cur = conn.cursor()
             count = 0
             for it in items:
+                line_type = str(it.get("line_type") or LINE_TYPE_DEFAULT).upper()
+                if line_type not in LINE_TYPE_CHOICES:
+                    line_type = LINE_TYPE_DEFAULT
                 cur.execute(
                     """
                     INSERT INTO receipt_items (
                         receipt_id, product_name, quantity, unit,
                         unit_price_net, unit_price_gross, tax_rate,
-                        line_net, line_tax, line_gross
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        line_net, line_tax, line_gross, line_type
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                     """,
                     (
                         receipt_id,
@@ -347,6 +445,7 @@ class ProductDatabase:
                         it.get("line_net"),
                         it.get("line_tax"),
                         it.get("line_gross"),
+                        line_type,
                     ),
                 )
                 count += 1
@@ -564,6 +663,7 @@ class ProductDatabase:
                     line_net,
                     line_tax,
                     line_gross,
+                    line_type,
                     created_at
                 FROM receipt_items
                 WHERE receipt_id = ?

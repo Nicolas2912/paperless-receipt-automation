@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 import base64, hashlib, json, logging, mimetypes, os, time, sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -13,6 +13,15 @@ from dotenv import load_dotenv
 try:
     from ...logging import get_logger
     from ...config import load_openai, load_ollama, load_openrouter
+    from ..watch import read_watch_dir_from_file
+    from .constants import (
+        LINE_TYPE_CHOICES,
+        LINE_TYPE_DEFAULT,
+        LINE_TYPE_DEPOSIT_CHARGE,
+        LINE_TYPE_DEPOSIT_REFUND,
+        LINE_TYPE_DISCOUNT,
+        LINE_TYPES_ALLOWING_NEGATIVES,
+    )
 except Exception:
     # Allow running this file directly (no package parent)
     _HERE = os.path.dirname(__file__)
@@ -21,6 +30,15 @@ except Exception:
         sys.path.insert(0, _SRC)
     from paperless_automation.logging import get_logger
     from paperless_automation.config import load_openai, load_ollama, load_openrouter
+    from paperless_automation.orchestrator.watch import read_watch_dir_from_file
+    from paperless_automation.orchestrator.productdb.constants import (
+        LINE_TYPE_CHOICES,
+        LINE_TYPE_DEFAULT,
+        LINE_TYPE_DEPOSIT_CHARGE,
+        LINE_TYPE_DEPOSIT_REFUND,
+        LINE_TYPE_DISCOUNT,
+        LINE_TYPES_ALLOWING_NEGATIVES,
+    )
 import requests
 
 LOG = get_logger("productdb-extraction")
@@ -46,6 +64,9 @@ if _OPENROUTER_PDF_ENGINE_ENV is not None:
         LOG.debug("Configured OpenRouter PDF engine: %s", OPENROUTER_PDF_ENGINE)
 else:
     OPENROUTER_PDF_ENGINE = "pdf-text"
+
+PFAND_KEYWORDS: Tuple[str, ...] = ("pfand", "leergut", "einweg", "mehrweg")
+DISCOUNT_KEYWORDS: Tuple[str, ...] = ("rabatt", "discount", "gutschein", "coupon", "nachlass")
 
 # ---------- file helpers (unchanged) ----------
 def _b64_data_url(path: str) -> Optional[str]:
@@ -86,6 +107,57 @@ def _file_facts(path: str) -> Dict[str, Any]:
         pass
     mime, _ = mimetypes.guess_type(path)
     return {"filename": os.path.basename(path), "mime_type": mime, "byte_size": size, "sha256": sha256}
+
+# ---------- scan folder helpers ----------
+DEFAULT_SCAN_IMAGE_EXTENSIONS: Set[str] = {".jpg", ".jpeg", ".png", ".pdf"}
+
+def _normalize_extensions(exts: Iterable[str]) -> Set[str]:
+    normalized: Set[str] = set()
+    for value in exts:
+        if not value:
+            continue
+        clean = value.strip().lower()
+        if not clean:
+            continue
+        if not clean.startswith("."):
+            clean = "." + clean
+        normalized.add(clean)
+    return normalized
+
+def list_scan_image_paths(
+    config_path: Optional[str] = None,
+    *,
+    recursive: bool = False,
+    exts: Optional[Iterable[str]] = None,
+) -> List[str]:
+    """Return sorted absolute paths for all scanned receipts in the configured folder."""
+
+    directory = read_watch_dir_from_file(config_path)
+    allowed_exts = _normalize_extensions(exts or DEFAULT_SCAN_IMAGE_EXTENSIONS)
+
+    matches: List[str] = []
+    if recursive:
+        walker = os.walk(directory)
+    else:
+        try:
+            entries = os.listdir(directory)
+        except Exception as exc:
+            LOG.error("Failed to list scan directory %s: %s", directory, exc)
+            return []
+        walker = [(directory, [], entries)]
+
+    for root, _, filenames in walker:
+        for name in filenames:
+            full_path = os.path.join(root, name)
+            if not os.path.isfile(full_path):
+                continue
+            _, ext = os.path.splitext(name)
+            if ext.lower() not in allowed_exts:
+                continue
+            matches.append(os.path.abspath(full_path))
+
+    matches.sort()
+    return matches
 
 
 # ---------- dataclasses & containers ----------
@@ -165,72 +237,138 @@ class OpenRouterConfig:
 # ---------- prompt & schema (your originals) ----------
 def _prompt() -> str:
     return """
-Extract data from a retail receipt image.
+## Task
+Extract data from a retail image or PDF of a receipt. Read carefully and favor precision over recall. If uncertain, omit the uncertain item rather than guessing.
 
-Output requirements (strict):
-
+## Output (strict)
 Return ONLY strict JSON (no code fences, no commentary).
-The top-level object MUST have exactly these keys:
-
+The top-level object MUST have exactly these keys (no more, no less):
 - merchant
 - date
 - currency
 - payment_method
 - items
 
-Field specifications:
-- merchant:
+### Schema: items
+Each line item must include:
+- description: string (raw text from the receipt line)
+- quantity: integer (>= 1), always positive
+- unit: string|null
+- line_net: integer (cents); sign-preserving (see rules)
+- line_gross: integer (cents); sign-preserving (see rules)
+- vat_rate: number|null
+- line_type: enum { NORMAL, DEPOSIT_CHARGE, DEPOSIT_REFUND }
 
-	{ "name": string, "street": string, "city": string, "postal_code": string }
+### Token cues for Pfand classification
+Use case-insensitive matching; treat hyphens/whitespace/umlauts equivalently.
+- Deposit CHARGE cues → DEPOSIT_CHARGE:
+  - "pfand" (incl. "ew-pfand", "mehrwegpfand", "mw-pfand", "pfand bier")
+  - "einweg" when attached to pfand context (e.g., "einweg-pfand", "ew-pfand")
+  - "mehrweg" when attached to pfand context (e.g., "mehrweg-pfand", "mw-pfand")
+- Deposit REFUND cues → DEPOSIT_REFUND:
+  - "rückgabe", "rueckgabe", "rück-", "rueck-"
+  - "leergut", "einweg-leergut", "mehrweg-leergut"
+  - "pfandbon", "pfand-rück", "pfand rueck", "pfand rück", "einlösung pfand"
+  - phrases like "einwegleergut", "mehrwegleergut"
 
+Normalize spelling and separators only for interpretation—do not alter the extracted description.
+
+### Amount sign rules (CRITICAL)
+- Preserve the sign exactly as printed on the receipt. Do not flip the sign during fixes or validation.
+- DEPOSIT_CHARGE lines are expected to be positive (no leading minus).
+- DEPOSIT_REFUND lines are expected to be negative (leading minus).
+- If sign and cues disagree:
+  - Sign is the source of truth for line_net/line_gross. Keep the printed sign.
+  - Use the cues to set line_type consistently with the observed sign:
+    - Negative amount + any pfand/return cue → DEPOSIT_REFUND.
+    - Positive amount (or no sign) + any pfand cue → DEPOSIT_CHARGE.
+- Explicit clarity for “Leergut”:
+  - Only classify as DEPOSIT_REFUND if the printed amount is negative (has a leading minus).
+  - If “Leergut” (or any refund cue) shows a positive amount or no sign, treat it as DEPOSIT_CHARGE (do not infer a refund).
+- quantity stays positive (usually 1) for both charges and refunds. Do not encode refunds via negative quantity.
+
+### Non-item attribute lines (do not emit as separate items)
+Never create a separate item from lines that only provide details for an adjacent product and do not represent an independent charge. Attach them to their owning product for arithmetic validation only. Examples:
+- Weight/unit-price details: patterns like “1,106 kg x 1,29 EUR/kg”, “0,756 kg x 2,49 €/kg”, “750 g x 1,99 €/kg”
+- Per-unit annotations: “je 1,39”, “à 1,39”, “0,25 Pfand je”
+- Quantity-only/multiplier lines without a row total
+Handling:
+- If a product line with a gross total exists (e.g., “Bananen 1,99 €”) and the next line is a weight/unit-price detail (“1,106 kg x 1,29 EUR/kg”), emit only ONE item using the product line text as description and the printed gross total (1,99 €) for line_gross. Do not emit the detail line as an item.
+- Use the detail line solely to validate that line_gross ≈ weight × unit_price within 1 cent. If it disagrees, prefer the printed row total on the product line. If still uncertain, omit the item rather than guessing.
+
+### Field rules for Pfand lines
+- line_gross and line_net are integers in cents.
+- For DEPOSIT_REFUND: line_gross < 0 and line_net < 0; quantity > 0.
+- For DEPOSIT_CHARGE: line_gross > 0 and line_net > 0; quantity > 0.
+- Prefer classifying a line as deposit (charge/refund) over NORMAL if pfand cues are present, but never override the printed sign.
+- When a merchandise line and an adjacent pfand line share a brand (e.g., beer), keep them as two separate items: the product (NORMAL) and the deposit (DEPOSIT_*).
+- Pfand quantity: If a unit pfand value is visible (e.g., “0,25”) and the pfand line gross equals a multiple of it, set quantity = line_gross_cents / unit_value_cents; otherwise default to 1.
+
+### Validation (Pfand & amounts)
+- line_net and line_gross: absolute value must be positive; sign encodes charge (+) vs refund (−). Never coerce negatives to positive or vice versa.
+- quantity: positive integer.
+- Totals sanity: Summed line_gross across items may include both positive (charges) and negative (refunds). Do not “fix” by flipping signs.
+- Leergut example clarity:
+  - “Leergut −0,50 €” → DEPOSIT_REFUND, line_gross = −50
+  - “Leergut 0,50 €” or “Leergut 0,50” (no minus) → DEPOSIT_CHARGE, line_gross = 50
+
+### Extraction checklist (apply in this order)
+1) Parse numeric amount exactly as printed (capture the leading minus if present) and convert to cents.
+2) Detect pfand cues (see lists above).
+3) Set line_type using cues and the observed sign (sign wins for amounts).
+4) Enforce sign conventions: charge → positive; refund → negative. If a mismatch is found, do not change the amount; instead, align line_type to the observed sign.
+5) Non-item attribute lines: If a line matches weight/unit-price/multiplier patterns and lacks its own row total context, attach it to the nearest product per layout rules below; never emit as a separate item.
+6) Quantity detection:
+   - Explicit multiplier near the item: detect patterns like “(\d+)[x×*](\s*)?(\d+[.,]\d{2})”, “Menge \d+”, “Anz\.?\s*\d+”, “Anzahl \d+”, “je \d+[.,]\d{2}”, “à \d+[.,]\d{2}”.
+   - Netto layout rule: On Netto Marken-Discount receipts, a quantity line like “2x 1,39” appears before the product and belongs to the next non-empty product line. Confirm that line_gross ≈ 2 × 1,39 €.
+   - Famila layout rule: On Famila receipts, the quantity is printed directly beneath the item it belongs to (not before it). Link the quantity line to the item above.
+7) Weighed items safeguard:
+   - If weight and price-per-kg/l are shown (e.g., “1,106 kg x 1,29 EUR/kg”) and a row total is printed on the product line, set quantity = 1 for the product, use the product line’s gross total, and do not emit the detail line.
+   - If only a single line shows both weight × unit price and a computed total as part of that same line, emit one item using that line’s description and total; quantity = 1.
+8) Arithmetic cross-check:
+   - If a unit price appears and line_gross is known, compute candidate = round(line_gross_cents / unit_price_cents).
+   - If remainder ≤ 1 cent and candidate ≥ 1, set quantity = candidate (even if step 6 didn’t trigger).
+   - If an explicit quantity disagrees with arithmetic, choose the value where line_gross ≈ quantity × unit_price within 1 cent.
+9) Fallback: If no signals exist, set quantity = 1.
+
+### Field specifications
+- merchant: { "name": string, "street": string, "city": string, "postal_code": string }
 - date: purchase date in "DD.MM.YYYY" format
-- currency: 3-letter code
+- currency: 3-letter code (e.g., EUR)
 - payment_method: CASH | CARD | OTHER
-- items: array of objects. Each item has:
+- items: array of objects, each:
+  { "description": string, "quantity": int, "unit": string|null, "line_net": int, "line_gross": int, "vat_rate": number|null, "line_type": enum }
 
-	{ "product_name": string, "line_gross": int, "amount": int, "tax": decimal }
+### Rules
+- line_gross = the row total in cents (German: Summe, Gesamt, Zwischensumme (Pos.)). Sign-preserving per Pfand rules above.
+- vat_rate = decimal (e.g., 19% → 0.19, 7% → 0.07). In Germany, default to 0.19 or 0.07 based on the item line; do not invent other rates unless explicitly printed.
+- Locale parsing: “1,39” → €1.39 → 139 cents. Dots may be thousand separators. Ignore unit-price per kg/l unless needed for arithmetic cross-checks.
+- Inclusion: Include only purchasable line items and Pfand. Exclude headers, totals, discounts (unless itemized), coupons, payment blocks, VAT summaries, and all non-item attribute lines (weight/unit price details, “je/à ...”).
+- Do not infer missing fields from prior knowledge or brand templates. If a field is not visible, leave it empty ("") or null.
 
-Rules:
-- line_gross = price in euro cents (e.g., 3.49€ → 349).
-- tax = tax as decimal (e.g., 19% → 0.19, 7% → 0.07).
-- amount = actual quantity (should be read as the numeric amount listed next to or below the product).
-- Only include purchasable line items (exclude headers, totals, discounts, etc.).
-- Please search on the receipt for something that indicates the payment method (CASH, CARD, OTHER).
-- Do not repeat yourself. End exactly with the last item in the list.
+### Payment method detection
+Map receipt tokens to:
+- CARD: EC, girocard, Maestro, Visa, Mastercard, Kreditkarte, Karte, kontaktlos, Terminal-Auth, PAN-masked numbers.
+- CASH: Bar, Barzahlung, Wechselgeld.
+- OTHER: Gutschein, Wallet, PayPal, Klarna, Apple Pay, Google Pay only if printed and not card-routed.
 
-Example:
+### Date selection
+Use the purchase date (not print time) closest to payment/terminal blocks. Prefer numeric DD.MM.YYYY. If multiple, choose the one near totals or payment section.
 
-	{
-	  "merchant": {
-	    "name": "Rewe Supermarkt",
-	    "street": "Musterstraße 12",
-	    "city": "Berlin",
-	    "postal_code": "12345"
-	  },
-	  "date": "27.09.2025",
-      "currency": "EUR",
-      "payment_method": "CARD",
-	  "items": [
-	    {
-	      "product_name": "Gala Äpfel 1kg",
-	      "line_gross": 299,
-	      "amount": 2,
-	      "tax": 0.07
-	    },
-	    {
-	      "product_name": "Milch 1L",
-	      "line_gross": 119,
-	      "amount": 1,
-	      "tax": 0.07
-	    },
-	    {
-	      "product_name": "Nutella 450g",
-	      "line_gross": 369,
-	      "amount": 1,
-	      "tax": 0.19
-	    }
-	  ]
-	}
+### Merchant parsing
+Extract exact merchant name and address as printed at the header (or imprint). Normalize street and postal code/city if split across lines. Do not fabricate.
+
+### Final validation
+- items[].quantity must be > 0. Monetary fields can be negative only for line_type = DEPOSIT_REFUND; otherwise non-negative.
+- items[].vat_rate must be 0.19, 0.07, or null for German receipts unless another rate is explicitly shown.
+- If a unit price is present, ensure abs(line_gross_cents − quantity × unit_price_cents) ≤ 1.
+- If the receipt prints a per-item subtotal or overall total, ensure the sum of included items does not contradict those figures by more than a rounding cent; if conflicted, re-check linkage (quantity → product) before omitting uncertain items.
+- Absolutely do not emit standalone attribute lines (weights, “x EUR/kg”, “je/à ...”) as separate items.
+
+### Output reminder
+Return only the final JSON object matching the schema. Do not include explanations, notes, or extra keys.
+
+Conversion sanity note: Only convert the printed price (e.g., 1,23 € or 12,99 €) into integer cents (123, 1299). Never append or remove zeros—preserve numeric precision exactly as printed.
     
 """
 
@@ -277,7 +415,7 @@ def _receipt_schema() -> Dict[str, Any]:
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["product_name","quantity","unit","unit_price_net","unit_price_gross","tax_rate","line_net","line_tax","line_gross"],
+                    "required": ["product_name","quantity","unit","unit_price_net","unit_price_gross","tax_rate","line_net","line_tax","line_gross","line_type"],
                     "properties": {
                         "product_name": {"type": "string"},
                         "quantity": {"type": "number"},
@@ -288,6 +426,7 @@ def _receipt_schema() -> Dict[str, Any]:
                         "line_net": {"type": ["integer","null"]},
                         "line_tax": {"type": ["integer","null"]},
                         "line_gross": {"type": ["integer","null"]},
+                        "line_type": {"type": "string", "enum": list(LINE_TYPE_CHOICES)},
                     },
                 },
             },
@@ -388,17 +527,54 @@ class PayloadNormalizer:
                 items.append(item)
         return items
 
+    def _normalize_line_type(
+        self,
+        raw_value: Any,
+        *,
+        product_name: str,
+        line_amounts: Tuple[Optional[int], Optional[int], Optional[int]],
+    ) -> str:
+        if isinstance(raw_value, str):
+            candidate = raw_value.strip().upper()
+            if candidate in LINE_TYPE_CHOICES:
+                return candidate
+
+        net, tax, gross = line_amounts
+        amounts = [value for value in (gross, net, tax) if value is not None]
+        negative_present = any(value is not None and value < 0 for value in amounts)
+        lower_name = (product_name or "").lower()
+
+        if any(keyword in lower_name for keyword in DISCOUNT_KEYWORDS):
+            return LINE_TYPE_DISCOUNT
+
+        if any(keyword in lower_name for keyword in PFAND_KEYWORDS):
+            return LINE_TYPE_DEPOSIT_REFUND if negative_present else LINE_TYPE_DEPOSIT_CHARGE
+
+        if negative_present:
+            return LINE_TYPE_DEPOSIT_REFUND
+
+        return LINE_TYPE_DEFAULT
+
     def _normalize_item(self, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        name = self._text(item.get("product_name") or item.get("name"))
+        name = self._text(
+            item.get("product_name") or item.get("name") or item.get("description")
+        )
         if not name:
             return None
 
         quantity = self._coerce_quantity(item.get("quantity") or item.get("amount"))
-        tax_rate = self._normalize_tax_rate(item.get("tax_rate") or item.get("tax"))
+        tax_rate = self._normalize_tax_rate(
+            item.get("tax_rate") or item.get("tax") or item.get("vat_rate")
+        )
 
         line_gross = self._coerce_int_cents(item.get("line_gross") or item.get("gross") or item.get("total"))
         line_net = self._coerce_int_cents(item.get("line_net"))
         line_tax = self._coerce_int_cents(item.get("line_tax"))
+        line_type = self._normalize_line_type(
+            item.get("line_type"),
+            product_name=name,
+            line_amounts=(line_net, line_tax, line_gross),
+        )
 
         if line_net is None or line_tax is None:
             computed_net, computed_tax = self._compute_net_and_tax(line_gross, tax_rate)
@@ -410,6 +586,25 @@ class PayloadNormalizer:
         if line_tax is not None and line_gross is not None and line_net is None:
             line_net = line_gross - line_tax
 
+        allow_negative = line_type in LINE_TYPES_ALLOWING_NEGATIVES
+        line_net = self._ensure_non_negative(
+            line_net,
+            field_name="line_net",
+            item_name=name,
+            allow_negative=allow_negative,
+        )
+        line_tax = self._ensure_non_negative(
+            line_tax,
+            field_name="line_tax",
+            item_name=name,
+            allow_negative=allow_negative,
+        )
+        line_gross = self._ensure_non_negative(
+            line_gross,
+            field_name="line_gross",
+            item_name=name,
+            allow_negative=allow_negative,
+        )
         unit_price_gross = self._coerce_int_cents(item.get("unit_price_gross"))
         if unit_price_gross is None:
             unit_price_gross = self._compute_unit_value(line_gross, quantity)
@@ -428,6 +623,7 @@ class PayloadNormalizer:
             "line_net": line_net,
             "line_tax": line_tax,
             "line_gross": line_gross,
+            "line_type": line_type,
         }
         return normalized
 
@@ -552,6 +748,26 @@ class PayloadNormalizer:
         except InvalidOperation:
             return total_cents
         return cls._round_half_up(per_unit)
+
+    @staticmethod
+    def _ensure_non_negative(
+        value: Optional[int],
+        *,
+        field_name: str,
+        item_name: str,
+        allow_negative: bool = False,
+    ) -> Optional[int]:
+        if value is None:
+            return None
+        if value >= 0 or allow_negative:
+            return value
+        LOG.warning(
+            "Normalized %s for item %s is negative (%s); clearing due to unsupported line type.",
+            field_name,
+            item_name or "<unknown>",
+            value,
+        )
+        return None
 
     @classmethod
     def _summarize_totals(cls, items: List[Dict[str, Any]]) -> Dict[str, Optional[int]]:

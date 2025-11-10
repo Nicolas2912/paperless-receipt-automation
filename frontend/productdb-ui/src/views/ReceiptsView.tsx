@@ -354,6 +354,7 @@ const ReceiptsView = () => {
                     <TableHead>
                       <TableRow>
                         <TableCell>Product</TableCell>
+                        <TableCell>Type</TableCell>
                         <TableCell align="right">Quantity</TableCell>
                         <TableCell align="right">Unit Net</TableCell>
                         <TableCell align="right">Unit Gross</TableCell>
@@ -373,6 +374,9 @@ const ReceiptsView = () => {
                                 </Typography>
                               )}
                             </Stack>
+                          </TableCell>
+                          <TableCell>
+                            <Chip size="small" label={item.line_type} variant="outlined" />
                           </TableCell>
                           <TableCell align="right">{item.quantity}</TableCell>
                           <TableCell align="right">

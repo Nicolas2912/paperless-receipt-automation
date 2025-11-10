@@ -4,7 +4,7 @@ import argparse
 import json
 import os
 import sys
-from typing import Sequence
+from typing import List, Sequence
 
 from ..logging import get_logger
 from ..orchestrator import (
@@ -19,6 +19,7 @@ from ..orchestrator.transcribe import transcribe_image
 from ..orchestrator.metadata import extract_metadata
 from ..paths import expand_abs
 from ..orchestrator.productdb import ReceiptExtractionService
+from ..orchestrator.productdb.extraction import list_scan_image_paths
 
 LOG = get_logger("cli-main")
 
@@ -264,6 +265,49 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(result, ensure_ascii=False))
         return 0
     pdb_extract.set_defaults(handler=_pdb_extract)
+
+    pdb_ingest = pdb_sub.add_parser(
+        "ingest",
+        help="Extract and persist every scan under the configured scans folder.",
+        description="Reads scan-image-path.txt, enumerates all JPG/PNG/PDF files, and feeds them into productdb.",
+    )
+    pdb_ingest.add_argument("--config-path", help="Override location of scan-image-path.txt")
+    pdb_ingest.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Walk subdirectories when enumerating scans (slow for large trees).",
+    )
+    pdb_ingest.add_argument("--model", default="gpt-5-mini", help="LLM model tag used for each extraction.")
+    pdb_ingest.add_argument("--dry-run", action="store_true", help="List files without touching the database.")
+    def _pdb_ingest(ns: argparse.Namespace) -> int:
+        scan_paths = list_scan_image_paths(ns.config_path, recursive=ns.recursive)
+        if not scan_paths:
+            LOG.warning("No scan files found to ingest (scan directory may be empty or missing).")
+            return 0
+
+        svc = ReceiptExtractionService()
+        failures: List[str] = []
+        for source_path in scan_paths:
+            LOG.info("Processing scan: %s", source_path)
+            if ns.dry_run:
+                print(source_path)
+                continue
+
+            result = svc.run_and_persist(source_path, model_name=ns.model, script_dir=os.getcwd())
+            if result is None:
+                failures.append(source_path)
+
+        if ns.dry_run:
+            LOG.info("Dry run complete; listed %d files.", len(scan_paths))
+            return 0
+
+        if failures:
+            LOG.error("Failed to ingest %d scan(s). See logs for details.", len(failures))
+            return 1
+
+        LOG.info("Ingested %d scans.", len(scan_paths))
+        return 0
+    pdb_ingest.set_defaults(handler=_pdb_ingest)
 
     pdb_serve = pdb_sub.add_parser(
         "serve",
