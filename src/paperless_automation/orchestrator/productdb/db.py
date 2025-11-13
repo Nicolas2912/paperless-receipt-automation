@@ -31,6 +31,12 @@ CREATE TABLE IF NOT EXISTS addresses (
   postal_code  TEXT,
   country      TEXT
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_addresses_unique ON addresses(
+  LOWER(TRIM(COALESCE(street,''))),
+  LOWER(TRIM(COALESCE(city,''))),
+  LOWER(TRIM(COALESCE(postal_code,''))),
+  UPPER(TRIM(COALESCE(country,'')))
+);
 
 CREATE TABLE IF NOT EXISTS merchants (
   merchant_id  INTEGER PRIMARY KEY,
@@ -156,6 +162,7 @@ class ProductDatabase:
             LOG.info("Ensuring product DB schema is present…")
             self._migrate_extraction_runs_drop_prompt_version(conn)
             self._migrate_receipt_items_line_types(conn)
+            self._deduplicate_addresses(conn)
             cur.executescript(SCHEMA_SQL)
             conn.commit()
             LOG.info("Product DB schema ensured.")
@@ -321,21 +328,92 @@ class ProductDatabase:
         finally:
             conn.execute("PRAGMA foreign_keys=ON;")
 
+    def _deduplicate_addresses(self, conn: sqlite3.Connection) -> None:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='addresses';"
+        )
+        if cur.fetchone() is None:
+            return
+        cur.execute(
+            "SELECT address_id, street, city, postal_code, country FROM addresses ORDER BY address_id;"
+        )
+        rows = cur.fetchall()
+        seen: Dict[Tuple[str, str, str, str], int] = {}
+        for row in rows:
+            payload = {
+                "street": row["street"],
+                "city": row["city"],
+                "postal_code": row["postal_code"],
+                "country": row["country"],
+            }
+            normalized = self._normalize_address_fields(payload)
+            if normalized is None:
+                normalized = (None, None, None, None)
+            key = self._address_key(normalized)
+            canonical_id = seen.get(key)
+            if canonical_id is None:
+                seen[key] = row["address_id"]
+                if normalized != (
+                    row["street"],
+                    row["city"],
+                    row["postal_code"],
+                    row["country"],
+                ):
+                    cur.execute(
+                        """
+                        UPDATE addresses
+                        SET street = ?, city = ?, postal_code = ?, country = ?
+                        WHERE address_id = ?;
+                        """,
+                        (*normalized, row["address_id"]),
+                    )
+                continue
+            cur.execute(
+                "UPDATE merchants SET address_id = ? WHERE address_id = ?;",
+                (canonical_id, row["address_id"]),
+            )
+            cur.execute(
+                "DELETE FROM addresses WHERE address_id = ?;",
+                (row["address_id"],),
+            )
+        conn.commit()
+
     # --------------- Insert/Upsert helpers ---------------
-    def insert_address(self, addr: Dict[str, Optional[str]]) -> int:
+    def insert_address(self, addr: Dict[str, Optional[str]]) -> Optional[int]:
+        normalized = self._normalize_address_fields(addr)
+        if normalized is None:
+            return None
+        key = self._address_key(normalized)
         with self.connect() as conn:
             cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT address_id
+                FROM addresses
+                WHERE
+                    LOWER(TRIM(COALESCE(street,''))) = ?
+                    AND LOWER(TRIM(COALESCE(city,''))) = ?
+                    AND LOWER(TRIM(COALESCE(postal_code,''))) = ?
+                    AND UPPER(TRIM(COALESCE(country,''))) = ?
+                LIMIT 1;
+                """,
+                key,
+            )
+            row = cur.fetchone()
+            if row:
+                return int(row[0])
             cur.execute(
                 """
                 INSERT INTO addresses (street, city, postal_code, country)
                 VALUES (?, ?, ?, ?)
                 RETURNING address_id;
                 """,
-                (addr.get("street"), addr.get("city"), addr.get("postal_code"), addr.get("country")),
+                normalized,
             )
-            row = cur.fetchone()
+            new_row = cur.fetchone()
             conn.commit()
-            return int(row[0])
+            return int(new_row[0])
 
     def upsert_merchant(self, name: str, address_id: Optional[int]) -> int:
         with self.connect() as conn:
@@ -473,6 +551,49 @@ class ProductDatabase:
             row = cur.fetchone()
             conn.commit()
             return int(row[0])
+
+    # --------------- Address normalization helpers ---------------
+    @staticmethod
+    def _normalize_address_component(
+        value: Optional[str],
+        *,
+        lowercase: bool = False,
+        uppercase: bool = False,
+    ) -> Optional[str]:
+        if value is None:
+            return None
+        cleaned = " ".join(str(value).strip().split())
+        if not cleaned:
+            return None
+        if lowercase:
+            cleaned = cleaned.lower()
+        elif uppercase:
+            cleaned = cleaned.upper()
+        return cleaned
+
+    @classmethod
+    def _normalize_address_fields(
+        cls, addr: Dict[str, Optional[str]]
+    ) -> Optional[Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]]:
+        street = cls._normalize_address_component(addr.get("street"))
+        city = cls._normalize_address_component(addr.get("city"))
+        postal_code = cls._normalize_address_component(addr.get("postal_code"), lowercase=True)
+        country = cls._normalize_address_component(addr.get("country"), uppercase=True)
+        if not any((street, city, postal_code, country)):
+            return None
+        return street, city, postal_code, country
+
+    @staticmethod
+    def _address_key(
+        fields: Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]
+    ) -> Tuple[str, str, str, str]:
+        street, city, postal_code, country = fields
+        return (
+            (street or "").lower(),
+            (city or "").lower(),
+            (postal_code or "").lower(),
+            (country or "").upper(),
+        )
 
     # --------------- Query helpers ---------------
     @staticmethod

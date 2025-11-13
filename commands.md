@@ -1,6 +1,6 @@
 # Prequisites
 
-- Make sure to run this at first:
+- Make sure to run this at first (powershell):
 
 ```bash
  $env:PYTHONPATH="$PWD\src"

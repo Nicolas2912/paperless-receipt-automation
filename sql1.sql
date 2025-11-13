@@ -1,8 +1,35 @@
-SELECT * from receipt_items WHERE receipt_id = 23
-SELECT SUM(line_gross) from receipt_items WHERE receipt_id = 23
+SELECT * from receipt_items WHERE receipt_id = 1
+SELECT SUM(line_gross) from receipt_items WHERE receipt_id = 1
 SELECT * from correct_data
 
 SELECT SUM(line_gross) from receipt_items GROUP BY receipt_id
+
+SELECT * from receipt
+
+DELETE from correct_data
+-- create correct data TABLE
+CREATE TABLE correct_data (
+  receipt_item INT,
+  line_gross INT
+);
+
+INSERT INTO correct_data (receipt_item, line_gross) VALUES
+(1, 5901),
+(2, 1330),
+(3, 6484),
+(4, 1470),
+(5, 1372),
+(6, 805),
+(7, 770),
+(8, 2750),
+(9, 3282),
+(10, 1733),
+(11, 5101),
+(12, 725),
+(13, 4129),
+(14, 12375),
+(15, 921),
+(16, 1247);
 
 -- delete everything
 DELETE FROM receipt_items;

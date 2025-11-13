@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
-import base64, hashlib, json, logging, mimetypes, os, time, sys
+import base64, hashlib, json, logging, mimetypes, os, time, sys, re
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -254,10 +254,37 @@ Each line item must include:
 - description: string (raw text from the receipt line)
 - quantity: integer (>= 1), always positive
 - unit: string|null
+- unit_price_net: integer|null (cents, per unit; NOT the row total)
+- unit_price_gross: integer|null (cents, per unit; NOT the row total)
 - line_net: integer (cents); sign-preserving (see rules)
 - line_gross: integer (cents); sign-preserving (see rules)
 - vat_rate: number|null
 - line_type: enum { NORMAL, DEPOSIT_CHARGE, DEPOSIT_REFUND }
+
+### Unit price vs row total (CRITICAL)
+If a line shows both a unit price and a row total, then:
+- unit_price_gross = unit price per piece (cents)
+- line_gross = quantity × unit_price_gross (row total in cents)
+
+Example:
+- "Pfandtasche 4 A 0,50 € 2,00 € *"
+  → quantity = 4
+  → unit_price_gross = 50   (0,50 €)
+  → line_gross = 200        (2,00 €)
+
+Example Netto layout:
+- Line 1: "TOMATEN"
+- Line 2: "2x 1,39"
+- Line 3: "SKYR 1,39 €"
+
+You must output ONE item for SKYR:
+- description = "SKYR 1,39 €"
+- quantity = 2
+- unit_price_gross = 139  (1,39 €)
+- line_gross = 278        (2 × 1,39 €)
+
+Tomaten stays quantity = 1 unless its own multiplier is printed.
+Netto layout rule: a standalone multiplier line like "2x 1,39" belongs to the next product line below it, not the one above.
 
 ### Token cues for Pfand classification
 Use case-insensitive matching; treat hyphens/whitespace/umlauts equivalently.
@@ -330,6 +357,7 @@ Handling:
    - If remainder ≤ 1 cent and candidate ≥ 1, set quantity = candidate (even if step 6 didn’t trigger).
    - If an explicit quantity disagrees with arithmetic, choose the value where line_gross ≈ quantity × unit_price within 1 cent.
 9) Fallback: If no signals exist, set quantity = 1.
+10) Include all items (food and non-food)! Please make sure to really include everything listed on the receipt that is an actual item and end with the last item right above "Summe".
 
 ### Field specifications
 - merchant: { "name": string, "street": string, "city": string, "postal_code": string }
@@ -337,7 +365,7 @@ Handling:
 - currency: 3-letter code (e.g., EUR)
 - payment_method: CASH | CARD | OTHER
 - items: array of objects, each:
-  { "description": string, "quantity": int, "unit": string|null, "line_net": int, "line_gross": int, "vat_rate": number|null, "line_type": enum }
+  { "description": string, "quantity": int, "unit": string|null, "unit_price_net": int|null, "unit_price_gross": int|null, "line_net": int, "line_gross": int, "vat_rate": number|null, "line_type": enum }
 
 ### Rules
 - line_gross = the row total in cents (German: Summe, Gesamt, Zwischensumme (Pos.)). Sign-preserving per Pfand rules above.
@@ -363,7 +391,7 @@ Extract exact merchant name and address as printed at the header (or imprint). N
 - items[].vat_rate must be 0.19, 0.07, or null for German receipts unless another rate is explicitly shown.
 - If a unit price is present, ensure abs(line_gross_cents − quantity × unit_price_cents) ≤ 1.
 - If the receipt prints a per-item subtotal or overall total, ensure the sum of included items does not contradict those figures by more than a rounding cent; if conflicted, re-check linkage (quantity → product) before omitting uncertain items.
-- Absolutely do not emit standalone attribute lines (weights, “x EUR/kg”, “je/à ...”) as separate items.
+- Absolutely do not emit standalone attribute lines (weights, “x EUR/kg”, “je/à ...”) as separate items. And do not emit lines like "Summe", "Gesamt", "Total", "Endbetrag", "Betrag", etc. as items.
 
 ### Output reminder
 Return only the final JSON object matching the schema. Do not include explanations, notes, or extra keys.
@@ -458,6 +486,14 @@ class PayloadNormalizer:
         "%Y-%m-%d",
         "%d-%m-%Y",
         "%Y/%m/%d",
+    )
+    TOTAL_HEADER_TOKENS: Tuple[str, ...] = (
+        "summe",
+        "gesamt",
+        "total",
+        "zwischensumme",
+        "endsumme",
+        "endbetrag",
     )
 
     def __init__(self, facts: FileFacts) -> None:
@@ -561,6 +597,9 @@ class PayloadNormalizer:
         )
         if not name:
             return None
+        if self._looks_like_total_header(name):
+            LOG.debug("Dropping header/total line treated as item: %r", name)
+            return None
 
         quantity = self._coerce_quantity(item.get("quantity") or item.get("amount"))
         tax_rate = self._normalize_tax_rate(
@@ -575,6 +614,28 @@ class PayloadNormalizer:
             product_name=name,
             line_amounts=(line_net, line_tax, line_gross),
         )
+        raw_unit_price_gross = self._coerce_int_cents(item.get("unit_price_gross"))
+
+        if (
+            raw_unit_price_gross is not None
+            and line_gross is not None
+            and quantity > 1.0
+            and abs(line_gross) == abs(raw_unit_price_gross)
+        ):
+            corrected_gross = int(abs(raw_unit_price_gross) * quantity)
+            if line_gross < 0:
+                corrected_gross *= -1
+            LOG.debug(
+                "Correcting line_gross for '%s' from %s to %s using quantity %.2f and unit_price_gross %s",
+                name,
+                line_gross,
+                corrected_gross,
+                quantity,
+                raw_unit_price_gross,
+            )
+            line_gross = corrected_gross
+            line_net = None
+            line_tax = None
 
         if line_net is None or line_tax is None:
             computed_net, computed_tax = self._compute_net_and_tax(line_gross, tax_rate)
@@ -605,13 +666,20 @@ class PayloadNormalizer:
             item_name=name,
             allow_negative=allow_negative,
         )
-        unit_price_gross = self._coerce_int_cents(item.get("unit_price_gross"))
+        unit_price_gross = raw_unit_price_gross
         if unit_price_gross is None:
             unit_price_gross = self._compute_unit_value(line_gross, quantity)
 
         unit_price_net = self._coerce_int_cents(item.get("unit_price_net"))
         if unit_price_net is None:
             unit_price_net = self._compute_unit_value(line_net, quantity)
+
+        quantity = self._adjust_quantity_from_unit_price(
+            quantity=quantity,
+            raw_unit_price_gross=raw_unit_price_gross,
+            line_gross=line_gross,
+            item_name=name,
+        )
 
         normalized = {
             "product_name": name,
@@ -626,6 +694,49 @@ class PayloadNormalizer:
             "line_type": line_type,
         }
         return normalized
+
+    @staticmethod
+    @staticmethod
+    def _levenshtein(left: str, right: str) -> int:
+        """Compute Levenshtein distance for short strings."""
+        m, n = len(left), len(right)
+        if m == 0:
+            return n
+        if n == 0:
+            return m
+        prev = list(range(n + 1))
+        for i, ca in enumerate(left, 1):
+            curr = [i] + [0] * n
+            for j, cb in enumerate(right, 1):
+                cost = 0 if ca == cb else 1
+                curr[j] = min(
+                    prev[j] + 1,      # deletion
+                    curr[j - 1] + 1,  # insertion
+                    prev[j - 1] + cost,  # substitution
+                )
+            prev = curr
+        return prev[n]
+
+    @classmethod
+    def _looks_like_total_header(cls, name: str) -> bool:
+        """Return True if text resembles a receipt total/header line."""
+        if not name:
+            return False
+        lowered = name.lower()
+        if any(token in lowered for token in cls.TOTAL_HEADER_TOKENS):
+            return True
+        stripped = re.sub(r"\[[^\]]*\]", "", lowered)
+        tokens = re.findall(r"[a-zäöüß]+", stripped)
+        if not tokens:
+            return False
+        targets = ("summe", "gesamt", "total")
+        for token in tokens:
+            if len(token) < 3:
+                continue
+            for target in targets:
+                if cls._levenshtein(token, target) <= 2:
+                    return True
+        return False
 
     # ---- totals helpers -----------------------------------------------------------
     def _normalize_totals(self, totals_payload: Any, items: List[Dict[str, Any]]) -> Dict[str, Optional[int]]:
@@ -748,6 +859,43 @@ class PayloadNormalizer:
         except InvalidOperation:
             return total_cents
         return cls._round_half_up(per_unit)
+
+    def _adjust_quantity_from_unit_price(
+        self,
+        *,
+        quantity: float,
+        raw_unit_price_gross: Optional[int],
+        line_gross: Optional[int],
+        item_name: str,
+    ) -> float:
+        if (
+            raw_unit_price_gross is None
+            or raw_unit_price_gross == 0
+            or line_gross is None
+            or quantity <= 0
+        ):
+            return quantity
+        try:
+            candidate = Decimal(abs(line_gross)) / Decimal(abs(raw_unit_price_gross))
+        except InvalidOperation:
+            return quantity
+        candidate_int = candidate.to_integral_value(rounding=ROUND_HALF_UP)
+        if candidate_int < 1:
+            return quantity
+        if abs(candidate - candidate_int) > Decimal("0.01"):
+            return quantity
+        candidate_float = float(candidate_int)
+        if abs(candidate_float - quantity) < 0.5:
+            return quantity
+        LOG.debug(
+            "Adjusting quantity for '%s' from %.2f to %.2f using line_gross=%s and unit_price_gross=%s",
+            item_name,
+            quantity,
+            candidate_float,
+            line_gross,
+            raw_unit_price_gross,
+        )
+        return candidate_float
 
     @staticmethod
     def _ensure_non_negative(

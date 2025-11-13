@@ -21,6 +21,7 @@ def _seed_database(root: Path) -> int:
             "country": "DE",
         }
     )
+    assert address_id is not None
     merchant_id = db.upsert_merchant("Testmarkt", address_id)
     receipt_id = db.insert_receipt(
         {
