@@ -238,7 +238,8 @@ class OpenRouterConfig:
 def _prompt() -> str:
     return """
 ## Task
-Extract data from a retail image or PDF of a receipt. Read carefully and favor precision over recall. If uncertain, omit the uncertain item rather than guessing.
+Extract data from a retail image or PDF of a receipt. Read very carefully and capture every product (food and non-food) and Pfand line. When uncertain, still include the line as an item with your best transcription; set numeric fields you cannot read confidently to null instead of skipping the item.
+Read line by line to get every product (food and non-food) and Pfand lines.
 
 ## Output (strict)
 Return ONLY strict JSON (no code fences, no commentary).
@@ -321,7 +322,16 @@ Never create a separate item from lines that only provide details for an adjacen
 - Quantity-only/multiplier lines without a row total
 Handling:
 - If a product line with a gross total exists (e.g., “Bananen 1,99 €”) and the next line is a weight/unit-price detail (“1,106 kg x 1,29 EUR/kg”), emit only ONE item using the product line text as description and the printed gross total (1,99 €) for line_gross. Do not emit the detail line as an item.
-- Use the detail line solely to validate that line_gross ≈ weight × unit_price within 1 cent. If it disagrees, prefer the printed row total on the product line. If still uncertain, omit the item rather than guessing.
+- Use the detail line solely to validate that line_gross ≈ weight × unit_price within 1 cent. If it disagrees, prefer the printed row total on the product line. If still uncertain, include the item with the best description you have and leave unknown numeric fields as null rather than skipping it.
+ - **VAT / tax summary rows are NEVER items.**
+      Examples (like on Famila receipts):
+      - Header line: "x-Satz   MWST   Netto   Brutto"
+      - Group rows: "A 19 %   0,91   4,82   5,73" or "B 7 %   0,52   7,47   7,99"
+      These rows summarize groups of items and must NOT appear in the `items` array at all.
+      They must never be used as `line_gross` for any product.
+
+      For every item in `items`, `line_gross` MUST be the price printed on the same line as that product.
+
 
 ### Field rules for Pfand lines
 - line_gross and line_net are integers in cents.
@@ -358,6 +368,7 @@ Handling:
    - If an explicit quantity disagrees with arithmetic, choose the value where line_gross ≈ quantity × unit_price within 1 cent.
 9) Fallback: If no signals exist, set quantity = 1.
 10) Include all items (food and non-food)! Please make sure to really include everything listed on the receipt that is an actual item and end with the last item right above "Summe".
+Double check and verfiy deeply on every line of the receipt.
 
 ### Field specifications
 - merchant: { "name": string, "street": string, "city": string, "postal_code": string }
@@ -371,8 +382,7 @@ Handling:
 - line_gross = the row total in cents (German: Summe, Gesamt, Zwischensumme (Pos.)). Sign-preserving per Pfand rules above.
 - vat_rate = decimal (e.g., 19% → 0.19, 7% → 0.07). In Germany, default to 0.19 or 0.07 based on the item line; do not invent other rates unless explicitly printed.
 - Locale parsing: “1,39” → €1.39 → 139 cents. Dots may be thousand separators. Ignore unit-price per kg/l unless needed for arithmetic cross-checks.
-- Inclusion: Include only purchasable line items and Pfand. Exclude headers, totals, discounts (unless itemized), coupons, payment blocks, VAT summaries, and all non-item attribute lines (weight/unit price details, “je/à ...”).
-- Do not infer missing fields from prior knowledge or brand templates. If a field is not visible, leave it empty ("") or null.
+- Inclusion: Include all items you see and end with the last item right above "Summe".
 
 ### Payment method detection
 Map receipt tokens to:
@@ -390,7 +400,7 @@ Extract exact merchant name and address as printed at the header (or imprint). N
 - items[].quantity must be > 0. Monetary fields can be negative only for line_type = DEPOSIT_REFUND; otherwise non-negative.
 - items[].vat_rate must be 0.19, 0.07, or null for German receipts unless another rate is explicitly shown.
 - If a unit price is present, ensure abs(line_gross_cents − quantity × unit_price_cents) ≤ 1.
-- If the receipt prints a per-item subtotal or overall total, ensure the sum of included items does not contradict those figures by more than a rounding cent; if conflicted, re-check linkage (quantity → product) before omitting uncertain items.
+- If the receipt prints a per-item subtotal or overall total, ensure the sum of included items does not contradict those figures by more than a rounding cent; if conflicted, re-check linkage (quantity → product) and include the questionable line with partial data instead of dropping it.
 - Absolutely do not emit standalone attribute lines (weights, “x EUR/kg”, “je/à ...”) as separate items. And do not emit lines like "Summe", "Gesamt", "Total", "Endbetrag", "Betrag", etc. as items.
 
 ### Output reminder
@@ -507,7 +517,26 @@ class PayloadNormalizer:
         currency = (str(raw.get("currency")) if raw.get("currency") else "EUR").upper()
         payment_method = (str(raw.get("payment_method")) if raw.get("payment_method") else "OTHER").upper()
 
-        items = [item for item in self._normalize_items(raw.get("items") or []) if item]
+        payload_items = raw.get("items")
+        if not isinstance(payload_items, list):
+            payload_items = []
+        if LOG.isEnabledFor(logging.DEBUG):
+            LOG.debug("Raw items from model: %d", len(payload_items))
+            for idx, candidate in enumerate(payload_items, 1):
+                if isinstance(candidate, dict):
+                    raw_name = candidate.get("product_name") or candidate.get("name") or candidate.get("description")
+                    LOG.debug("RAW ITEM %02d: %r", idx, raw_name if raw_name else candidate)
+                else:
+                    LOG.debug("RAW ITEM %02d (non-dict): %r", idx, candidate)
+
+        items = [item for item in self._normalize_items(payload_items) if item]
+        if LOG.isEnabledFor(logging.DEBUG):
+            LOG.debug("Normalized items after filters: %d", len(items))
+            for idx, item in enumerate(items, 1):
+                LOG.debug("NORM ITEM %02d: %r", idx, item.get("product_name"))
+            dropped = len(payload_items) - len(items)
+            if dropped > 0:
+                LOG.debug("Items dropped during normalization: %d", dropped)
         totals = self._normalize_totals(raw.get("totals"), items)
 
         normalized: Dict[str, Any] = {
@@ -598,7 +627,7 @@ class PayloadNormalizer:
         if not name:
             return None
         if self._looks_like_total_header(name):
-            LOG.debug("Dropping header/total line treated as item: %r", name)
+            LOG.warning("Dropping item because it looks like a header/total line: %r", name)
             return None
 
         quantity = self._coerce_quantity(item.get("quantity") or item.get("amount"))
@@ -722,20 +751,29 @@ class PayloadNormalizer:
         """Return True if text resembles a receipt total/header line."""
         if not name:
             return False
-        lowered = name.lower()
-        if any(token in lowered for token in cls.TOTAL_HEADER_TOKENS):
+        lowered = name.lower().strip()
+        if not lowered:
+            return False
+        header_tokens_pattern = r"^(?:%s)\b" % "|".join(re.escape(token) for token in cls.TOTAL_HEADER_TOKENS)
+        if re.match(header_tokens_pattern, lowered):
             return True
         stripped = re.sub(r"\[[^\]]*\]", "", lowered)
         tokens = re.findall(r"[a-zäöüß]+", stripped)
         if not tokens:
             return False
+        first_token = tokens[0]
+        # aggressively catch common OCR slips of "SUMME" while keeping other
+        # headers strict to reduce accidental matches from product names.
+        if re.fullmatch(r"su[mn][mn]e", first_token):
+            return True
+
         targets = ("summe", "gesamt", "total")
-        for token in tokens:
-            if len(token) < 3:
-                continue
-            for target in targets:
-                if cls._levenshtein(token, target) <= 2:
-                    return True
+        for target in targets:
+            max_dist = 1
+            if target == "summe" and len(first_token) == 5:
+                max_dist = 2
+            if cls._levenshtein(first_token, target) <= max_dist:
+                return True
         return False
 
     # ---- totals helpers -----------------------------------------------------------
