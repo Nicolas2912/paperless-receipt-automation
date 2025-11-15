@@ -71,7 +71,6 @@ def test_parse_backfills_totals_and_preserves_raw_content():
             {
                 "product_name": "JT SEELACHSF 950G",
                 "quantity": 1,
-                "unit": None,
                 "unit_price_net": 532,
                 "unit_price_gross": 569,
                 "tax_rate": 0.07,
@@ -82,7 +81,6 @@ def test_parse_backfills_totals_and_preserves_raw_content():
             {
                 "product_name": "GOENRGY MANGO 0.5L",
                 "quantity": 1,
-                "unit": None,
                 "unit_price_net": 125,
                 "unit_price_gross": 149,
                 "tax_rate": 0.19,

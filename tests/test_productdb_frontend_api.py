@@ -43,7 +43,6 @@ def _seed_database(root: Path) -> int:
             {
                 "product_name": "Bio Milch",
                 "quantity": 2,
-                "unit": "x",
                 "unit_price_net": 350,
                 "unit_price_gross": 400,
                 "tax_rate": 0.07,

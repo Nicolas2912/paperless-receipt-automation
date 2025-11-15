@@ -16,10 +16,10 @@
 python -m paperless_automation productdb extract --source "C:\Users\Anwender\iCloudDrive\Documents\Scans\2025-09-20_famila_3.jpeg"
 ```
 
-# Testing openrouter image extraction (one file)
+# Testing openrouter full ingestion of all files in scan dir
 
  ```bash
-python -m paperless_automation productdb ingest"
+python -m paperless_automation productdb ingest
 ```
 
 # Init productdb database

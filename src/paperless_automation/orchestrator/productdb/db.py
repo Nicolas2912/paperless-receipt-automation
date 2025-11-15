@@ -83,7 +83,6 @@ CREATE TABLE IF NOT EXISTS receipt_items (
   receipt_id        INTEGER NOT NULL REFERENCES receipts(receipt_id) ON DELETE CASCADE,
   product_name      TEXT NOT NULL,
   quantity          REAL NOT NULL CHECK(quantity > 0),
-  unit              TEXT,               -- "x","kg","l"
   unit_price_net    INTEGER,            -- cents (nullable)
   unit_price_gross  INTEGER,            -- cents (nullable)
   tax_rate          REAL NOT NULL CHECK(tax_rate IN (0.00, 0.07, 0.19)),
@@ -237,7 +236,7 @@ class ProductDatabase:
             conn.execute("PRAGMA foreign_keys=ON;")
 
     def _migrate_receipt_items_line_types(self, conn: sqlite3.Connection) -> None:
-        """Ensure receipt_items can store line_type and negative amounts."""
+        """Ensure receipt_items schema matches current expectations."""
         cur = conn.cursor()
         try:
             cur.execute("PRAGMA table_info(receipt_items);")
@@ -256,10 +255,13 @@ class ProductDatabase:
         has_non_negative_checks = any(
             check in table_sql for check in ("CHECK(line_net", "CHECK(line_tax", "CHECK(line_gross")
         )
-        if has_line_type and not has_non_negative_checks:
+        has_unit_column = "unit" in columns
+
+        needs_migration = has_unit_column or (not has_line_type) or (has_line_type and not has_non_negative_checks)
+        if not needs_migration:
             return
 
-        LOG.info("Migrating receipt_items to add line_type and relax line amount checks")
+        LOG.info("Migrating receipt_items to add/normalize line_type schema and drop obsolete unit column")
         select_line_type = "line_type" if has_line_type else f"'{LINE_TYPE_DEFAULT}'"
         try:
             conn.execute("PRAGMA foreign_keys=OFF;")
@@ -272,7 +274,6 @@ class ProductDatabase:
                   receipt_id        INTEGER NOT NULL REFERENCES receipts(receipt_id) ON DELETE CASCADE,
                   product_name      TEXT NOT NULL,
                   quantity          REAL NOT NULL CHECK(quantity > 0),
-                  unit              TEXT,
                   unit_price_net    INTEGER,
                   unit_price_gross  INTEGER,
                   tax_rate          REAL NOT NULL CHECK(tax_rate IN (0.00, 0.07, 0.19)),
@@ -292,7 +293,6 @@ class ProductDatabase:
                   receipt_id,
                   product_name,
                   quantity,
-                  unit,
                   unit_price_net,
                   unit_price_gross,
                   tax_rate,
@@ -307,7 +307,6 @@ class ProductDatabase:
                   receipt_id,
                   product_name,
                   quantity,
-                  unit,
                   unit_price_net,
                   unit_price_gross,
                   tax_rate,
@@ -507,16 +506,15 @@ class ProductDatabase:
                 cur.execute(
                     """
                     INSERT INTO receipt_items (
-                        receipt_id, product_name, quantity, unit,
+                        receipt_id, product_name, quantity,
                         unit_price_net, unit_price_gross, tax_rate,
                         line_net, line_tax, line_gross, line_type
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                     """,
                     (
                         receipt_id,
                         it["product_name"],
                         float(it["quantity"]),
-                        it.get("unit"),
                         it.get("unit_price_net"),
                         it.get("unit_price_gross"),
                         float(it["tax_rate"]),
@@ -777,7 +775,6 @@ class ProductDatabase:
                     item_id,
                     product_name,
                     quantity,
-                    unit,
                     unit_price_net,
                     unit_price_gross,
                     tax_rate,

@@ -137,7 +137,6 @@ def parse_and_validate_payload(payload: Any) -> Dict[str, Any]:
         qty = _float_or(it.get("quantity"), 1.0)
         if qty <= 0:
             raise JsonValidationError(f"items[{idx}].quantity must be > 0")
-        unit = _norm_s(it.get("unit"))
         uprn = _int_or_none(it.get("unit_price_net"))
         uprg = _int_or_none(it.get("unit_price_gross"))
         tax_rate = _float_or(it.get("tax_rate"), 0.19)
@@ -162,7 +161,6 @@ def parse_and_validate_payload(payload: Any) -> Dict[str, Any]:
             {
                 "product_name": name,
                 "quantity": float(qty),
-                "unit": unit,
                 "unit_price_net": uprn,
                 "unit_price_gross": uprg,
                 "tax_rate": float(tax_rate),

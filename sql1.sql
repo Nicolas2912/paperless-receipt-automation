@@ -1,5 +1,5 @@
-SELECT * from receipt_items WHERE receipt_id = 1
-SELECT SUM(line_gross) from receipt_items WHERE receipt_id = 1
+SELECT * from receipt_items WHERE receipt_id = 6
+SELECT SUM(line_gross) from receipt_items WHERE receipt_id = 17
 SELECT * from correct_data
 
 SELECT SUM(line_gross) from receipt_items GROUP BY receipt_id

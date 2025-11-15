@@ -57,7 +57,6 @@ class ReceiptItem:
     receipt_id: int
     product_name: str
     quantity: float
-    unit: Optional[str]
     unit_price_net: Optional[int]
     unit_price_gross: Optional[int]
     tax_rate: float

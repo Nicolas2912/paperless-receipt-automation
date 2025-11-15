@@ -368,11 +368,6 @@ const ReceiptsView = () => {
                           <TableCell>
                             <Stack spacing={0.5}>
                               <Typography fontWeight={600}>{item.product_name}</Typography>
-                              {item.unit && (
-                                <Typography variant="caption" color="text.secondary">
-                                  Unit: {item.unit}
-                                </Typography>
-                              )}
                             </Stack>
                           </TableCell>
                           <TableCell>

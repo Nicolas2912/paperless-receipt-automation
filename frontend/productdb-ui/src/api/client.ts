@@ -44,7 +44,6 @@ export interface ReceiptItem {
   item_id: number;
   product_name: string;
   quantity: number;
-  unit: string | null;
   unit_price_net: number | null;
   unit_price_gross: number | null;
   tax_rate: number;

@@ -101,11 +101,10 @@ def _receipt_schema() -> Dict[str, Any]:
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["product_name","quantity","unit","unit_price_net","unit_price_gross","tax_rate","line_net","line_tax","line_gross"],
+                    "required": ["product_name","quantity","unit_price_net","unit_price_gross","tax_rate","line_net","line_tax","line_gross"],
                     "properties": {
                         "product_name": {"type": "string"},
                         "quantity": {"type": "number"},
-                        "unit": {"type": ["string","null"]},
                         "unit_price_net": {"type": ["integer","null"]},
                         "unit_price_gross": {"type": ["integer","null"]},
                         "tax_rate": {"type": "number", "enum": [0.0,0.07,0.19]},

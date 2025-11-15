@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
-import base64, hashlib, json, logging, mimetypes, os, time, sys, re
+import base64, hashlib, json, logging, mimetypes, os, time, sys, re, unicodedata
+from difflib import SequenceMatcher
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -13,6 +14,7 @@ from dotenv import load_dotenv
 try:
     from ...logging import get_logger
     from ...config import load_openai, load_ollama, load_openrouter
+    from ...paths import find_project_root, var_dir
     from ..watch import read_watch_dir_from_file
     from .constants import (
         LINE_TYPE_CHOICES,
@@ -30,6 +32,7 @@ except Exception:
         sys.path.insert(0, _SRC)
     from paperless_automation.logging import get_logger
     from paperless_automation.config import load_openai, load_ollama, load_openrouter
+    from paperless_automation.paths import find_project_root, var_dir
     from paperless_automation.orchestrator.watch import read_watch_dir_from_file
     from paperless_automation.orchestrator.productdb.constants import (
         LINE_TYPE_CHOICES,
@@ -64,6 +67,25 @@ if _OPENROUTER_PDF_ENGINE_ENV is not None:
         LOG.debug("Configured OpenRouter PDF engine: %s", OPENROUTER_PDF_ENGINE)
 else:
     OPENROUTER_PDF_ENGINE = "pdf-text"
+
+_FOCUSED_REASONING_ENV = os.getenv("OPENROUTER_FOCUSED_REASONING")
+if _FOCUSED_REASONING_ENV is None:
+    FOCUSED_REASONING_EFFORT: Optional[str] = "low"
+else:
+    _reasoning_candidate = _FOCUSED_REASONING_ENV.strip().lower()
+    if not _reasoning_candidate or _reasoning_candidate in {"off", "none", "disable", "disabled"}:
+        FOCUSED_REASONING_EFFORT = None
+    elif _reasoning_candidate not in {"low", "medium", "high"}:
+        LOG.warning(
+            "OPENROUTER_FOCUSED_REASONING=%s is invalid; expected low/medium/high. Falling back to 'low'.",
+            _FOCUSED_REASONING_ENV,
+        )
+        FOCUSED_REASONING_EFFORT = "low"
+    else:
+        FOCUSED_REASONING_EFFORT = _reasoning_candidate
+
+if FOCUSED_REASONING_EFFORT:
+    LOG.debug("Focused OpenRouter reasoning effort: %s", FOCUSED_REASONING_EFFORT)
 
 PFAND_KEYWORDS: Tuple[str, ...] = ("pfand", "leergut", "einweg", "mehrweg")
 DISCOUNT_KEYWORDS: Tuple[str, ...] = ("rabatt", "discount", "gutschein", "coupon", "nachlass")
@@ -190,6 +212,48 @@ class FileFacts:
         }
 
 
+def _slugify_for_filename(value: Optional[str], *, default: str) -> str:
+    if not isinstance(value, str):
+        return default
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip())
+    cleaned = re.sub(r"-{2,}", "-", cleaned)
+    cleaned = cleaned.strip("-_.")
+    return cleaned.lower() or default
+
+
+class ModelResponseStore:
+    """Persist model JSON responses per receipt run for later inspection."""
+
+    def __init__(self, *, script_dir: Optional[str], facts: FileFacts) -> None:
+        self.run_dir: Optional[str] = None
+        try:
+            root = find_project_root(script_dir or os.getcwd())
+            base_dir = os.path.join(var_dir(root), "model_responses")
+            os.makedirs(base_dir, exist_ok=True)
+            timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+            slug = _slugify_for_filename(facts.filename or "receipt", default="receipt")
+            sha_chunk = (facts.sha256 or "")[:8]
+            run_folder = "_".join(part for part in (timestamp, slug, sha_chunk) if part)
+            self.run_dir = os.path.join(base_dir, run_folder)
+            os.makedirs(self.run_dir, exist_ok=True)
+        except Exception as exc:
+            LOG.warning("Response storage disabled: %s", exc)
+
+    def write(self, scope: str, payload: Any) -> Optional[str]:
+        if not self.run_dir or payload is None:
+            return None
+        filename = f"{_slugify_for_filename(scope or 'response', default='response')}.json"
+        path = os.path.join(self.run_dir, filename)
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            LOG.warning("Failed to persist %s response to %s: %s", scope, path, exc)
+            return None
+        LOG.debug("Stored %s response at %s", scope, path)
+        return path
+
+
 def _openrouter_content_node(data_url: str, facts: FileFacts) -> Dict[str, Any]:
     mime = (facts.mime_type or "").lower()
     if mime.startswith("image/"):
@@ -232,6 +296,7 @@ class OpenRouterConfig:
     temperature: float = 0.0
     max_tokens: int = 8000
     timeout_seconds: int = 180
+    reasoning_effort: Optional[str] = None
 
 
 # ---------- prompt & schema (your originals) ----------
@@ -239,7 +304,7 @@ def _prompt() -> str:
     return """
 ## Task
 Extract data from a retail image or PDF of a receipt. Read very carefully and capture every product (food and non-food) and Pfand line. When uncertain, still include the line as an item with your best transcription; set numeric fields you cannot read confidently to null instead of skipping the item.
-Read line by line to get every product (food and non-food) and Pfand lines.
+Read line by line to get every product (food and non-food) and Pfand lines but not something like "SUMME" or "KARTENZAHLUNG" etc. ONLY real products!
 
 ## Output (strict)
 Return ONLY strict JSON (no code fences, no commentary).
@@ -254,7 +319,6 @@ The top-level object MUST have exactly these keys (no more, no less):
 Each line item must include:
 - description: string (raw text from the receipt line)
 - quantity: integer (>= 1), always positive
-- unit: string|null
 - unit_price_net: integer|null (cents, per unit; NOT the row total)
 - unit_price_gross: integer|null (cents, per unit; NOT the row total)
 - line_net: integer (cents); sign-preserving (see rules)
@@ -273,19 +337,19 @@ Example:
   → unit_price_gross = 50   (0,50 €)
   → line_gross = 200        (2,00 €)
 
-Example Netto layout:
+Example Netto and ALDI layout:
 - Line 1: "TOMATEN"
 - Line 2: "2x 1,39"
-- Line 3: "SKYR 1,39 €"
+- Line 3: "Zwiebeln 1,39 €"
 
 You must output ONE item for SKYR:
-- description = "SKYR 1,39 €"
+- description = "Zwiebeln 1,39 €"
 - quantity = 2
 - unit_price_gross = 139  (1,39 €)
 - line_gross = 278        (2 × 1,39 €)
 
 Tomaten stays quantity = 1 unless its own multiplier is printed.
-Netto layout rule: a standalone multiplier line like "2x 1,39" belongs to the next product line below it, not the one above.
+Netto and ALDI layout rule: a standalone multiplier line like "2x 1,39" belongs to the next product line below it, not the one above.
 
 ### Token cues for Pfand classification
 Use case-insensitive matching; treat hyphens/whitespace/umlauts equivalently.
@@ -376,7 +440,7 @@ Double check and verfiy deeply on every line of the receipt.
 - currency: 3-letter code (e.g., EUR)
 - payment_method: CASH | CARD | OTHER
 - items: array of objects, each:
-  { "description": string, "quantity": int, "unit": string|null, "unit_price_net": int|null, "unit_price_gross": int|null, "line_net": int, "line_gross": int, "vat_rate": number|null, "line_type": enum }
+  { "description": string, "quantity": int, "unit_price_net": int|null, "unit_price_gross": int|null, "line_net": int, "line_gross": int, "vat_rate": number|null, "line_type": enum }
 
 ### Rules
 - line_gross = the row total in cents (German: Summe, Gesamt, Zwischensumme (Pos.)). Sign-preserving per Pfand rules above.
@@ -409,6 +473,559 @@ Return only the final JSON object matching the schema. Do not include explanatio
 Conversion sanity note: Only convert the printed price (e.g., 1,23 € or 12,99 €) into integer cents (123, 1299). Never append or remove zeros—preserve numeric precision exactly as printed.
     
 """
+
+
+_FOCUSED_COMBINED_DEFAULT_PROMPT = (
+    """
+You are an expert at extracting precise structured data from retail receipts (grocery stores, discounters, etc.).
+
+Your ONLY task:
+
+Extract for each product line:
+product_name
+quantity
+tax_rate
+You MUST be extremely precise. Everything depends on your correctness.
+
+You will be given a receipt (as an image or text). Use ALL visible information on the receipt. Think carefully, reason step by step INTERNALLY, but DO NOT print
+your reasoning. Output ONLY the final JSON.
+
+======================================================================
+GENERAL TASK
+Go through the receipt from top to bottom.
+Identify every REAL product line (food or non-food).
+For each product line, determine:
+product_name: the product description on that line (or clearly associated with it).
+quantity: how many units were bought.
+tax_rate: VAT as a decimal, ONLY 0.07 or 0.19.
+Stop before totals:
+
+Do NOT include lines like "SUMME", "ZU ZAHLEN", "Endbetrag", "GESAMT", "TOTAL" etc.
+Do NOT include payment block, card info, dates, transaction ids, coupons, or MWST summary as products.
+======================================================================
+JSON OUTPUT FORMAT (STRICT)
+Output ONLY a JSON array.
+
+Each element is an object with EXACTLY these keys:
+
+[
+{
+"product_name": string,
+"quantity": number,
+"tax_rate": number
+},
+...
+]
+
+Do NOT include any other fields.
+
+Do NOT wrap the JSON in Markdown code fences, text, or comments.
+
+No trailing text. Only valid JSON.
+
+======================================================================
+TAX RATE RULES (GERMAN VAT)
+Tax rate must ALWAYS be one of:
+
+0.07 (for 7%)
+0.19 (for 19%)
+Use these cues:
+
+Letter codes at end of line:
+
+A → 19% → tax_rate = 0.19
+B → 7% → tax_rate = 0.07
+If a product line has "A" or "B" printed, you MUST use this mapping.
+MWST (VAT) summary table at the bottom:
+
+If the table shows ONLY one rate (e.g. "1 7,00% NETTO ... BRUTTO ..."),
+then ALL products on this receipt have that rate.
+Example: if only 7,00% appears, set tax_rate = 0.07 for every item.
+If the table shows two groups (e.g. 7% and 19%), use the letters (A/B/etc.)
+or line hints to assign the correct rate per item.
+If there is NO explicit letter and more than one rate in the summary:
+
+Use your best judgement based on product type:
+Typical 7% (0.07): most basic food, dairy, bread, cereals, fruits, vegetables.
+Typical 19% (0.19): household goods, detergents, cosmetics, non-food, many drinks, etc.
+But if you see any clear printed indication (letters, tax columns), FOLLOW the printed indication.
+Never invent other tax rates. Only 0.07 or 0.19 are allowed.
+
+======================================================================
+QUANTITY RULES – MULTIPLIER LINES (CRITICAL)
+Many German supermarket receipts (e.g. Netto, Aldi) print quantity on a separate line ABOVE the product:
+
+Examples of multiplier lines:
+
+"2 x 9,99 €"
+"2 x 1,09 €"
+"2 x 1,49 €"
+"2 x 1,29 €"
+"3x 0,79 €"
+These multiplier lines:
+
+Contain ONLY a number (N), a multiplication sign (x or ×), and a unit price (P).
+Do NOT contain the product name.
+Are NOT products themselves.
+ALWAYS refer to the next real product line below them.
+You MUST follow this algorithm:
+
+Detect multiplier lines with pattern "N x P" (or "NxP", with x or ×).
+For each multiplier line:
+a) Read N (integer quantity).
+b) Read P (unit price).
+c) Look at the next product line below that has a row total price G (e.g. "19,98 €").
+d) Compute N * P and compare to G.
+If N * P equals G (within 1 cent), then:
+Set quantity = N for that product.
+If N * P does NOT equal G, then this multiplier does NOT belong to that product.
+Do NOT change quantity for that product because of this line.
+Never apply one multiplier line to more than one product.
+Multiplier lines MUST NEVER appear as separate JSON items.
+
+======================================================================
+NETTO MARKEN-DISCOUNT LAYOUT (SPECIAL CASE)
+On Netto receipts:
+
+Multiplier lines like "2x 1,11" usually appear directly ABOVE the product line they belong to.
+
+Example:
+
+2 x 1,11
+GL. Speisequark mager 500g VLOG 1,11 B
+
+Correct JSON:
+{"product_name": "GL. Speisequark mager 500g VLOG", "quantity": 2, "tax_rate": 0.07}
+
+You MUST:
+
+Attach the multiplier ("2 x 1,11") to the NEXT product line ("GL. Speisequark ...").
+Check that 2 * 1,11 = 2,22 and that this matches the printed row total for that line.
+Set quantity = 2.
+Do NOT output any JSON item for the "2 x 1,11" line itself.
+======================================================================
+ALDI-STYLE LAYOUT WITH MULTIPLIERS AND WEIGHT DETAILS
+Example pattern:
+
+2 x 9,99 €
+Zimtschnecken 19,98 € 1
+
+2 x 1,09 €
+Schokolade Lindt 2,18 € 1
+
+
+You MUST interpret this as:
+
+"2 x 9,99 €" → belongs to "Zimtschnecken" because 2 * 9,99 = 19,98.
+→ quantity = 2.
+
+"2 x 1,09 €" → belongs to "Schokolade Lindt" because 2 * 1,09 = 2,18.
+→ quantity = 2.
+
+
+Correct JSON items (fields shown for clarity):
+
+[
+{"product_name": "Zimtschnecken", "quantity": 2, "tax_rate": 0.07},
+{"product_name": "Schokolade Lindt", "quantity": 2, "tax_rate": 0.07},
+]
+
+======================================================================
+WEIGHT DETAIL LINES (DO NOT CHANGE QUANTITY)
+Weight lines look like:
+
+"0,812 kg x 1,99 €/kg"
+"1,060 kg x 1,29 EUR/kg"
+"750 g x 1,99 €/kg"
+Rules:
+
+These lines are NOT products and must NOT appear in JSON.
+They provide extra detail for the product above or below (often fruit/veg).
+They DO NOT change the quantity:
+Quantities for such items are usually 1.
+The line gross price on the main product line is based on weight × price/kg.
+For weighted items, set:
+quantity = 1
+tax_rate from the same rules as any other food item.
+======================================================================
+DEFAULT QUANTITY WHEN NO MULTIPLIER
+If you do NOT find any clear multiplier line ("N x price") for a product, and the product is not clearly a bundle with explicit count, then set:
+
+quantity = 1
+Do NOT invent non-integer quantities for normal products.
+
+======================================================================
+FINAL SELF-CHECK BEFORE OUTPUT
+Before you output the JSON:
+
+Make sure you have included every REAL product on the receipt from the start of the item list down to just before the totals ("SUMME", "ZU ZAHLEN", "Endbetrag",
+etc.).
+Verify for every product:
+If there is a multiplier line "N x P" immediately above it where N * P equals its row total, then quantity MUST equal N.
+If NOT, quantity MUST be 1 (or a clearly indicated other integer).
+Verify that every tax_rate is either 0.07 or 0.19 and is consistent with letters (A/B) and MWST summary.
+Finally, output ONLY the JSON array with objects:
+
+product_name
+quantity
+tax_rate
+No explanations, no comments, no Markdown. Only valid JSON.
+""".strip()
+)
+
+_FOCUSED_QUANTITY_DEFAULT_PROMPT = (
+    """
+Your job is to extract the product name and quantity of all real products from a receipt. You strive for absolute 100% accuracy. Every product name
+and every quantity is absolutely correct. You use all your capabilites because this accuracy will save lifes.
+
+Your job:
+- Find every REAL product line (food or non-food).
+- For each product, output the correct quantity as a positive integer.
+- You MUST cover EVERY real product line from the first product down to the last product just before the totals block.
+- It is an ERROR to skip a real product line. If you are unsure, include your BEST GUESS instead of omitting the line.
+
+You MUST follow the rules and algorithm below EXACTLY.
+
+============================================================
+OUTPUT FORMAT (STRICT)
+============================================================
+
+- Return ONLY a JSON array.
+- Each element MUST be an object with exactly:
+
+  {
+    "product_name": string,
+    "quantity": number
+  }
+
+- product_name: the product description as printed (minor whitespace cleanup allowed).
+- quantity: positive integer (1, 2, 3, …).
+- There MUST be a 1:1 mapping between real product lines and JSON objects:
+  - One JSON object for each real product line.
+  - No missing products, no extra helper lines.
+- Do NOT output tax_rate or any other fields.
+- No commentary, no Markdown fences, no extra text. ONLY the JSON array.
+
+============================================================
+STEP 1 – IDENTIFY PRODUCT LINES
+============================================================
+
+A REAL product line usually:
+- Contains a product name (words, abbreviations).
+- Has a price on the right (row total), sometimes with a tax group letter.
+- Is located between the header and the totals ("SUMME", "ZU ZAHLEN", "Endbetrag", etc.).
+
+Do NOT treat as products:
+- Lines such as "SUMME", "ZU ZAHLEN", "GESAMT", "TOTAL".
+- Payment info, card info, transaction IDs, dates, MWST table.
+- Pure helper lines: weight details ("0,812 kg x 1,99 €/kg"), multipliers without names ("2 x 1,09 €"), etc.
+
+Start at the first product and stop right before the totals.
+EVERY real product line in this range MUST appear EXACTLY ONCE in your JSON output.
+If you are uncertain whether a line is a product or a helper, TREAT IT AS A PRODUCT with quantity = 1 rather than skipping it.
+
+============================================================
+STEP 2 – DEFAULT QUANTITY
+============================================================
+
+For every product line you find, start with:
+
+- quantity = 1
+
+You will then adjust quantity using multiplier rules.
+
+============================================================
+STEP 3 – MULTIPLIER LINES "N x PRICE" (GENERAL RULE)
+============================================================
+
+Some receipts print a separate line with a multiplier ABOVE the product line:
+
+Examples:
+- "2 x 9,99 €"
+- "2 x 1,09 €"
+- "3x 0,79 €"
+
+These are MULTIPLIER LINES with pattern:
+
+- N: integer quantity (2, 3, 4, …)
+- x or ×
+- PRICE P (e.g. 1,09 €)
+
+General rules for any store:
+
+1. A multiplier line is NOT a product. Never output it as JSON.
+2. A multiplier line may belong to the next product line below, but ONLY if all of this is true:
+   - The next line is a real product line with a row total G.
+   - N × P equals G (within 1 cent).
+3. If N × P equals G (within 1 cent), you may safely set:
+   - quantity = N for that product.
+4. If N × P does NOT equal G, or the association is unclear:
+   - Do NOT use this multiplier for that product.
+   - Leave quantity as 1.
+
+Never apply one multiplier line to more than one product.
+
+============================================================
+STEP 4 – SPECIAL RULE: ALDI & NETTO RECEIPTS
+============================================================
+
+This section applies ONLY if the store name in the header clearly indicates:
+
+- "ALDI"  OR
+- "Netto Marken-Discount" / "Netto"
+
+On ALDI and Netto receipts, the layout has a strong, fixed pattern:
+
+- Multiplier lines like "2 x 1,09 €" or "3x 0,79 €" appear DIRECTLY ABOVE the product they belong to.
+- The product line below shows a row total G that equals N × P.
+
+For ALDI and Netto receipts you MUST:
+
+1. Treat every standalone line that matches the pattern "N x PRICE" (no product name) as a multiplier candidate for the NEXT product line below.
+2. Read N and P from that line.
+3. Look at the very next real product line below:
+   - If its row total G satisfies N × P = G (within 1 cent), then:
+     - quantity for that product MUST be set to N.
+   - If N × P does not match G, ignore that multiplier for this product and keep quantity = 1.
+
+Important:
+- This “belongs to the item below” rule applies ONLY for ALDI and Netto receipts identified by their header.
+- Do NOT blindly apply this pattern to other supermarkets just because you see a "N x PRICE" line.
+  For other stores, use the GENERAL RULE: only change quantity if the N × P → G relationship is clear and unambiguous.
+
+============================================================
+STEP 5 – WEIGHT DETAIL LINES (DO NOT CHANGE QUANTITY)
+============================================================
+
+Weight/detail lines look like:
+
+- "0,812 kg x 1,99 €/kg"
+- "1,060 kg x 1,29 EUR/kg"
+- "750 g x 1,99 €/kg"
+
+Rules:
+
+- These lines explain weight and price-per-kg for the product above (often fruit/veg).
+- They are NOT products → never output them as JSON.
+- They DO NOT change quantity:
+  - Quantity for such items remains 1.
+  - The total price is already on the product line (e.g. "Bananas loose 1,62 €").
+
+============================================================
+STEP 6 – FINAL SELF-CHECK
+============================================================
+
+Before you output JSON:
+
+1. Ensure there is one JSON object per product line and NO missing products:
+   - Count all real product lines between header and totals.
+   - Count all JSON objects.
+   - These counts MUST be equal.
+2. For every product, check:
+
+   - If this is an ALDI or Netto receipt:
+     - Look for a multiplier "N x PRICE" directly above the product.
+     - If N × PRICE equals the row total G, quantity MUST equal N.
+   - For other stores:
+     - Only change quantity if there is a clear "N x PRICE" multiplier and N × PRICE clearly matches the row total G.
+     - Otherwise, quantity MUST remain 1.
+
+3. Make sure all quantities are positive integers and absolutely correct.
+
+Finally, output ONLY the JSON array with:
+- product_name
+- quantity
+""".strip()
+)
+
+
+_FOCUSED_TAX_DEFAULT_PROMPT = (
+    """
+Your job is to extract the product name and quantity of all real products from a receipt. You strive for absolute 100% accuracy. Every product name
+and every quantity is absolutely correct. You use all your capabilites because this accuracy will save lifes.
+
+Your job:
+- For every REAL product line, assign the correct German VAT rate as a decimal:
+  - 0.07  (7%)
+  - 0.19  (19%)
+- You MUST cover EVERY real product line from the first product down to the last product just before the totals block.
+- It is an ERROR to skip a real product line. If you are unsure, include your BEST GUESS (0.07 or 0.19) instead of omitting the line.
+
+============================================================
+OUTPUT FORMAT (STRICT)
+============================================================
+
+- Return ONLY a JSON array.
+- Each element MUST be an object with exactly:
+
+  {
+    "product_name": string,
+    "tax_rate": number
+  }
+
+- product_name: the product description as printed (minor whitespace cleanup allowed).
+- tax_rate: MUST be exactly 0.07 or 0.19.
+- There MUST be a 1:1 mapping between real product lines and JSON objects:
+  - One JSON object for each real product line.
+  - No missing products, no extra helper lines.
+- No other fields. No commentary, no Markdown, no extra text.
+
+============================================================
+STEP 1 – IDENTIFY PRODUCT LINES
+============================================================
+
+Use the same notion of product line as in the main extraction:
+- Lines with a product name and a row total price on the right.
+- Located between header and totals ("SUMME", "ZU ZAHLEN", "Endbetrag", etc.).
+
+Do NOT create entries for:
+- Totals, payment info, card info, transaction IDs, dates.
+- MWST summary table itself.
+- Pure helper lines like "0,812 kg x 1,99 €/kg" or "2 x 1,29 €".
+
+There must be one JSON object for each real product.
+If you are uncertain whether a line is a product or a helper, TREAT IT AS A PRODUCT and assign your best tax_rate guess (0.07 or 0.19) instead of skipping it.
+
+============================================================
+STEP 2 – PRIMARY TAX SOURCES
+============================================================
+
+You MUST use printed tax information as the primary source, in this order:
+
+1. **Letter codes on product lines**  
+   - If a line ends with a tax group letter, use the mapping:
+     - A → 19% → tax_rate = 0.19
+     - B → 7%  → tax_rate = 0.07
+   - If other letters are printed and mapped in the MWST table, use those mappings.
+
+2. **MWST summary table at the bottom**  
+   - This table often lists tax groups like:
+
+     "1   7,00%   NETTO  30,67   MWST-BETRAG  2,15   BRUTTO  32,82"
+
+   - If the table shows ONLY one rate (e.g. ONLY 7,00% and no 19,00%), then:
+     → ALL products on this receipt MUST use that rate (here tax_rate = 0.07).
+   - If it shows multiple groups (e.g. one entry for 7% and one for 19%), then:
+     - Use the letter/group mappings (A/B, etc.) to assign the correct rate per product.
+
+3. **Explicit percentages on or near product lines**  
+   - Rare, but if a product line explicitly mentions "7%" or "19%", use that.
+
+============================================================
+STEP 3 – DOMAIN KNOWLEDGE FALLBACK (ONLY WHEN NEEDED)
+============================================================
+
+If a product has no clear letter, no visible mapping and multiple rates exist, THEN use domain knowledge:
+
+- Likely 0.07 (food VAT):
+  - Basic foods: bread, milk, cheese, yoghurt, quark, cereals, pasta, rice, fruits, vegetables, flour, sugar, salt, nuts, etc.
+
+- Likely 0.19:
+  - Household/non-food: detergents, cleaning products, paper towels, foil, trash bags, cosmetics, shampoo, toothpaste, deodorant, razors, etc.
+  - Many drinks: soft drinks, alcohol, energy drinks, special beverages.
+
+If a deposit (Pfand) line is printed:
+- It normally shares the tax rate of the associated drink (usually 0.19).
+- If the receipt clearly marks the tax group for the deposit line, follow the letter instead.
+
+When in doubt, prefer the rate that keeps the MWST summary totals plausible and matches similar items on the same receipt.
+But NEVER omit a product: always choose 0.07 or 0.19 for every real product line.
+
+============================================================
+STEP 4 – SPECIAL CASE: SINGLE-RATE RECEIPTS (IMPORTANT)
+============================================================
+
+If the MWST table shows only ONE tax rate (e.g. "7,00%" and no other rate):
+
+- ALL products MUST have that same tax_rate.
+- Do NOT guess 0.19 for any product on such a receipt.
+- Example: if the table shows only 7,00%, then:
+  - All items (bread, fruit, dairy, tinned vegetables, etc.) → tax_rate = 0.07.
+
+============================================================
+STEP 5 – FINAL SELF-CHECK
+============================================================
+
+Before you output JSON:
+
+1. Ensure there is one tax_rate for every product line, and no extra entries:
+   - Count all real product lines between header and totals.
+   - Count all JSON objects.
+   - These counts MUST be equal.
+2. Confirm that every tax_rate is EXACTLY 0.07 or 0.19 (no other values).
+3. Check consistency:
+   - If a product line has letter A or B, its tax_rate must follow the mapping.
+   - If the MWST table shows only a single rate, all items must use that rate.
+   - Deposit/Pfand lines must not contradict the tax rate of their associated drink if that is clearly identifiable.
+4. If you are unsure about any line, include it with your best tax_rate guess instead of skipping it.
+
+Finally, output ONLY the JSON array of objects:
+- product_name
+- tax_rate
+""".strip()
+)
+
+
+_FOCUSED_DEFAULT_PROMPTS: Dict[str, str] = {
+    "quantity": _FOCUSED_QUANTITY_DEFAULT_PROMPT,
+    "tax_rate": _FOCUSED_TAX_DEFAULT_PROMPT,
+    "quantity_tax": _FOCUSED_COMBINED_DEFAULT_PROMPT,
+}
+
+_FOCUSED_PROMPT_OVERRIDES: Dict[str, Optional[str]] = {key: None for key in _FOCUSED_DEFAULT_PROMPTS}
+
+
+def _resolve_focus_target(target: str) -> List[str]:
+    normalized = (target or "").strip().lower()
+    if normalized in {"quantity", "qty"}:
+        return ["quantity"]
+    if normalized in {"tax", "tax_rate", "vat"}:
+        return ["tax_rate"]
+    if normalized in {"both", "all", "quantity_tax", "quantity+tax", "combined"}:
+        return ["quantity", "tax_rate"]
+    if normalized in {"quantity_tax_only"}:
+        return ["quantity_tax"]
+    return ["quantity", "tax_rate"]
+
+
+def set_focused_model_prompt(prompt: Optional[str], *, target: str = "quantity_tax") -> None:
+    """Configure custom prompts for the focused refinement runs.
+
+    ``target`` may be ``"quantity"``, ``"tax_rate"`` or ``"both"``/``"quantity_tax"``.
+    Passing ``None`` clears the override for the selected target(s).
+    """
+
+    targets = _resolve_focus_target(target)
+    for resolved in targets:
+        if resolved not in _FOCUSED_PROMPT_OVERRIDES:
+            continue
+        if prompt is None:
+            _FOCUSED_PROMPT_OVERRIDES[resolved] = None
+        else:
+            candidate = prompt.strip()
+            _FOCUSED_PROMPT_OVERRIDES[resolved] = candidate or None
+
+
+def build_focused_model_prompt(
+    custom_prompt: Optional[str] = None,
+    *,
+    target: str = "quantity_tax",
+) -> str:
+    """Return the prompt that should be used for the focused model invocation."""
+
+    if custom_prompt and custom_prompt.strip():
+        return custom_prompt.strip()
+
+    resolved_targets = _resolve_focus_target(target)
+    for resolved in resolved_targets:
+        override = _FOCUSED_PROMPT_OVERRIDES.get(resolved)
+        if override:
+            return override
+        default = _FOCUSED_DEFAULT_PROMPTS.get(resolved)
+        if default:
+            return default
+
+    return _FOCUSED_DEFAULT_PROMPTS["quantity_tax"]
 
 def _receipt_schema() -> Dict[str, Any]:
     return {
@@ -453,13 +1070,12 @@ def _receipt_schema() -> Dict[str, Any]:
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["product_name","quantity","unit","unit_price_net","unit_price_gross","tax_rate","line_net","line_tax","line_gross","line_type"],
-                    "properties": {
-                        "product_name": {"type": "string"},
-                        "quantity": {"type": "number"},
-                        "unit": {"type": ["string","null"]},
-                        "unit_price_net": {"type": ["integer","null"]},
-                        "unit_price_gross": {"type": ["integer","null"]},
+                "required": ["product_name","quantity","unit_price_net","unit_price_gross","tax_rate","line_net","line_tax","line_gross","line_type"],
+                "properties": {
+                    "product_name": {"type": "string"},
+                    "quantity": {"type": "number"},
+                    "unit_price_net": {"type": ["integer","null"]},
+                    "unit_price_gross": {"type": ["integer","null"]},
                         "tax_rate": {"type": "number", "enum": [0.0,0.07,0.19]},
                         "line_net": {"type": ["integer","null"]},
                         "line_tax": {"type": ["integer","null"]},
@@ -472,18 +1088,46 @@ def _receipt_schema() -> Dict[str, Any]:
     }
 
 
-def _scavenge_json_block(s: str) -> Optional[Dict[str, Any]]:
+def _scavenge_json_block(s: str) -> Optional[Any]:
     if not s:
         return None
-    start = s.find("{")
-    end = s.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    for idx in range(end, start, -1):
+
+    candidates: List[str] = []
+
+    # 1) Try fenced code blocks first (e.g., ```json ... ```)
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", s, re.DOTALL)
+    if fenced and fenced.group(1):
+        candidates.append(fenced.group(1).strip())
+
+    # 2) Try the full object slice
+    start_obj = s.find("{")
+    end_obj = s.rfind("}")
+    if start_obj != -1 and end_obj != -1 and end_obj > start_obj:
+        candidates.append(s[start_obj : end_obj + 1])
+
+    # 3) Try the full array slice
+    start_arr = s.find("[")
+    end_arr = s.rfind("]")
+    if start_arr != -1 and end_arr != -1 and end_arr > start_arr:
+        candidates.append(s[start_arr : end_arr + 1])
+
+    for candidate in candidates:
         try:
-            return json.loads(s[start:idx + 1])
+            return json.loads(candidate)
         except Exception:
             continue
+
+    return None
+
+
+def _extract_fenced_json(text: str) -> Optional[str]:
+    """If the model wrapped JSON in ``` or ```json fences, return the inner content."""
+
+    if not isinstance(text, str):
+        return None
+    match = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    if match and match.group(1):
+        return match.group(1).strip()
     return None
 
 
@@ -591,6 +1235,28 @@ class PayloadNormalizer:
             if item:
                 items.append(item)
         return items
+
+    def reconcile_after_overrides(self, payload: Dict[str, Any]) -> None:
+        """Re-run item normalization after focused overrides mutate key fields."""
+
+        items = payload.get("items")
+        if not isinstance(items, list) or not items:
+            return
+        for idx, candidate in enumerate(items):
+            if not isinstance(candidate, dict):
+                continue
+            normalized = self._normalize_item(candidate)
+            if not normalized:
+                LOG.warning(
+                    "Focused reconciliation skipped item #%s (%r); original values kept.",
+                    idx,
+                    candidate.get("product_name") if isinstance(candidate, dict) else candidate,
+                )
+                continue
+            items[idx].clear()
+            items[idx].update(normalized)
+        payload["items"] = items
+        payload["totals"] = self._normalize_totals(payload.get("totals"), items)
 
     def _normalize_line_type(
         self,
@@ -713,7 +1379,6 @@ class PayloadNormalizer:
         normalized = {
             "product_name": name,
             "quantity": float(quantity),
-            "unit": self._text(item.get("unit") or item.get("measure")),
             "unit_price_net": unit_price_net,
             "unit_price_gross": unit_price_gross,
             "tax_rate": float(tax_rate),
@@ -1027,6 +1692,8 @@ class OpenRouterClient:
             "temperature": self.config.temperature if temperature is None else temperature,
             "max_tokens": self.config.max_tokens if max_tokens is None else max_tokens,
         }
+        if self.config.reasoning_effort:
+            payload["reasoning"] = {"effort": self.config.reasoning_effort}
         if plugins:
             payload["plugins"] = plugins
         headers = {
@@ -1064,7 +1731,7 @@ class OpenRouterClient:
         max_tokens: Optional[int] = None,
         timeout: Optional[int] = None,
         plugins: Optional[List[Dict[str, Any]]] = None,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[Any]:
         text = self.chat(
             messages,
             temperature=temperature,
@@ -1077,6 +1744,11 @@ class OpenRouterClient:
         try:
             return json.loads(text)
         except Exception:
+            LOG.debug(
+                "JSON parse failed for model=%s; attempting fallback (first 500 chars: %r)",
+                self.config.model_name,
+                text[:500],
+            )
             return _scavenge_json_block(text)
 
     # ---- convenience helpers -----------------------------------------------------
@@ -1137,6 +1809,342 @@ class OpenRouterClient:
         if isinstance(text, str) and text.strip():
             return text.strip()
         return None
+
+
+# -------- Focused quantity/tax refinement helpers --------
+
+_ALLOWED_TAX_RATES: Tuple[Decimal, ...] = (Decimal("0.00"), Decimal("0.07"), Decimal("0.19"))
+_NAME_MATCH_THRESHOLD = 0.72
+
+
+def _decimal_from_value(value: Any) -> Optional[Decimal]:
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, (int,)):
+        return Decimal(value)
+    if isinstance(value, float):
+        return Decimal(str(value))
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        stripped = stripped.replace("%", "").replace(",", ".")
+        try:
+            return Decimal(stripped)
+        except InvalidOperation:
+            return None
+    return None
+
+
+def _normalize_focus_quantity(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, str):
+            candidate = float(value.strip().replace(",", "."))
+        else:
+            candidate = float(value)
+    except (TypeError, ValueError):
+        return None
+    if candidate <= 0:
+        return None
+    return candidate
+
+
+def _normalize_focus_tax_rate(value: Any) -> Optional[float]:
+    dec = _decimal_from_value(value)
+    if dec is None:
+        return None
+    if dec > 1:
+        dec = (dec / Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    else:
+        dec = dec.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    for allowed in _ALLOWED_TAX_RATES:
+        if abs(dec - allowed) <= Decimal("0.001"):
+            return float(allowed)
+    return None
+
+
+def _normalize_focus_rows(raw: Any) -> List[Dict[str, Any]]:
+    rows: Any = raw
+    if isinstance(rows, dict) and "items" in rows and isinstance(rows["items"], list):
+        rows = rows["items"]
+    if isinstance(rows, dict):
+        rows = [rows]
+    if not isinstance(rows, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    for idx, row in enumerate(rows):
+        if not isinstance(row, dict):
+            LOG.debug("Focused model row %s ignored (not an object)", idx)
+            continue
+        name = row.get("product_name")
+        if not isinstance(name, str) or not name.strip():
+            LOG.debug("Focused model row %s missing product_name; skipping", idx)
+            continue
+        normalized.append(
+            {
+                "product_name": name.strip(),
+                "quantity": _normalize_focus_quantity(row.get("quantity")),
+                "tax_rate": _normalize_focus_tax_rate(row.get("tax_rate")),
+            }
+        )
+    return normalized
+
+
+def _normalize_name_for_match(name: str) -> str:
+    if not isinstance(name, str):
+        return ""
+    normalized = unicodedata.normalize("NFKD", name)
+    ascii_only = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    cleaned = re.sub(r"[^a-z0-9]+", "", ascii_only.lower())
+    return cleaned
+
+
+def _match_item_index(items: List[str], candidate_name: str, *, threshold: float) -> Tuple[Optional[int], float]:
+    target_key = _normalize_name_for_match(candidate_name)
+    if not target_key:
+        return None, 0.0
+    best_idx: Optional[int] = None
+    best_score: float = 0.0
+    for idx, base_key in enumerate(items):
+        if not base_key:
+            continue
+        if base_key == target_key:
+            return idx, 1.0
+        if target_key in base_key or base_key in target_key:
+            score = 0.95
+        else:
+            score = SequenceMatcher(None, target_key, base_key).ratio()
+        if score > best_score:
+            best_idx = idx
+            best_score = score
+    if best_idx is not None and best_score >= threshold:
+        return best_idx, best_score
+    return None, best_score
+
+
+def apply_focused_quantity_tax_overrides(
+    items: List[Dict[str, Any]],
+    overrides: List[Dict[str, Any]],
+    *,
+    similarity_threshold: float = _NAME_MATCH_THRESHOLD,
+    fields: Optional[Iterable[str]] = None,
+) -> Dict[str, Any]:
+    """Merge focused override rows back into the normalized receipt items."""
+
+    summary = {
+        "attempted": len(overrides),
+        "updated_items": 0,
+        "unmatched_entries": 0,
+        "unchanged_matches": 0,
+        "details": [],
+    }
+    if not items or not overrides:
+        summary["unmatched_entries"] = len(overrides)
+        return summary
+
+    normalized_names = [_normalize_name_for_match(it.get("product_name", "")) for it in items]
+    allowed_fields = {"quantity", "tax_rate"}
+    if fields is not None:
+        requested = {field.strip().lower() for field in fields if isinstance(field, str)}
+        allowed_fields &= requested or set()
+
+    for override in overrides:
+        idx, score = _match_item_index(normalized_names, override.get("product_name", ""), threshold=similarity_threshold)
+        if idx is None:
+            summary["unmatched_entries"] += 1
+            continue
+        item = items[idx]
+        fields_changed: Dict[str, Dict[str, Any]] = {}
+
+        new_qty = override.get("quantity")
+        if "quantity" in allowed_fields and new_qty is not None:
+            old_qty = item.get("quantity")
+            if old_qty is None or abs(float(old_qty) - float(new_qty)) > 1e-6:
+                item["quantity"] = float(new_qty)
+                fields_changed["quantity"] = {"old": old_qty, "new": float(new_qty)}
+
+        new_tax = override.get("tax_rate")
+        if "tax_rate" in allowed_fields and new_tax is not None:
+            old_tax = item.get("tax_rate")
+            if old_tax is None or abs(float(old_tax) - float(new_tax)) > 1e-6:
+                item["tax_rate"] = float(new_tax)
+                fields_changed["tax_rate"] = {"old": old_tax, "new": float(new_tax)}
+
+        if fields_changed:
+            summary["updated_items"] += 1
+            summary["details"].append(
+                {
+                    "product_name": item.get("product_name"),
+                    "matched_override_name": override.get("product_name"),
+                    "similarity": round(score, 4),
+                    "fields": fields_changed,
+                }
+            )
+            LOG.debug(
+                "Focused override applied to '%s' (score %.2f): changed %s",
+                item.get("product_name"),
+                score,
+                ", ".join(fields_changed.keys()),
+            )
+        else:
+            summary["unchanged_matches"] += 1
+
+    return summary
+
+
+_FOCUSED_SCOPE_LABELS = {
+    "quantity": "quantity",
+    "tax_rate": "tax rate",
+    "quantity_tax": "quantity/tax",
+}
+
+
+def _focus_scope_label(scope: str) -> str:
+    return _FOCUSED_SCOPE_LABELS.get(scope, scope or "quantity/tax")
+
+
+def _request_focused_rows(
+    *,
+    api_key: str,
+    model_name: str,
+    data_url: str,
+    facts: FileFacts,
+    plugins: Optional[List[Dict[str, Any]]],
+    focus_scope: str,
+    custom_prompt: Optional[str] = None,
+    response_store: Optional[ModelResponseStore] = None,
+) -> Optional[List[Dict[str, Any]]]:
+    prompt = build_focused_model_prompt(custom_prompt, target=focus_scope)
+    config = OpenRouterConfig(
+        api_key=api_key,
+        model_name=model_name,
+        reasoning_effort=FOCUSED_REASONING_EFFORT,
+    )
+    client = OpenRouterClient(config)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                _openrouter_content_node(data_url, facts),
+            ],
+        }
+    ]
+    LOG.info(
+        "Running focused %s refinement with reasoning=%s",
+        _focus_scope_label(focus_scope),
+        config.reasoning_effort or "off",
+    )
+    raw_text = client.chat(
+        messages,
+        max_tokens=7000,
+        timeout=240,
+        plugins=plugins,
+    )
+
+    if response_store and raw_text is not None:
+        response_store.write(f"focused_{focus_scope}_raw", raw_text)
+
+    if raw_text is not None:
+        LOG.info("Focused %s RAW RESPONSE: %s", _focus_scope_label(focus_scope), raw_text)
+
+    # Parse without substring scavenging; allow fenced blocks
+    parsed = None
+    if raw_text:
+        fenced = _extract_fenced_json(raw_text)
+        to_parse = fenced if fenced is not None else raw_text
+        try:
+            parsed = json.loads(to_parse)
+        except Exception:
+            LOG.warning("Focused %s response is not valid JSON; skipping overrides.", _focus_scope_label(focus_scope))
+            return None
+
+    if response_store and parsed is not None:
+        response_store.write(f"focused_{focus_scope}", parsed)
+
+    normalized_rows = _normalize_focus_rows(parsed)
+    if not normalized_rows:
+        LOG.warning("Focused model returned no usable rows.")
+        return None
+    return normalized_rows
+
+
+def _apply_focused_updates(
+    normalized_payload: Dict[str, Any],
+    *,
+    api_key: str,
+    model_name: str,
+    data_url: str,
+    facts: FileFacts,
+    plugins: Optional[List[Dict[str, Any]]],
+    focus_scope: str,
+    allowed_fields: Iterable[str],
+    enrichment_key: str,
+    response_store: Optional[ModelResponseStore] = None,
+) -> None:
+    items = normalized_payload.get("items")
+    if not isinstance(items, list) or not items:
+        LOG.debug("Skipping focused %s refinement; no items present.", focus_scope)
+        return
+    overrides = _request_focused_rows(
+        api_key=api_key,
+        model_name=model_name,
+        data_url=data_url,
+        facts=facts,
+        plugins=plugins,
+        focus_scope=focus_scope,
+        response_store=response_store,
+    )
+    if not overrides:
+        return
+    summary = apply_focused_quantity_tax_overrides(items, overrides, fields=allowed_fields)
+    enrichment = normalized_payload.setdefault("_enrichment", {})
+    enrichment[enrichment_key] = summary
+
+    receipt_label = facts.filename or normalized_payload.get("source_file", {}).get("filename") or "<unknown source>"
+    _log_focused_override_summary(summary, receipt_label, focus_scope)
+
+
+def _log_focused_override_summary(summary: Dict[str, Any], receipt_label: str, focus_scope: str) -> None:
+    if not summary:
+        return
+    if summary.get("details"):
+        scope_label = _focus_scope_label(focus_scope)
+        for entry in summary["details"]:
+            name = entry.get("product_name") or entry.get("matched_override_name") or "<unnamed>"
+            fields = entry.get("fields", {})
+            snippets = []
+            if "quantity" in fields:
+                delta = fields["quantity"]
+                snippets.append(f"qty {delta.get('old')}→{delta.get('new')}")
+            if "tax_rate" in fields:
+                delta = fields["tax_rate"]
+                snippets.append(f"tax {delta.get('old')}→{delta.get('new')}")
+            similarity = entry.get("similarity")
+            similarity_note = f" (match={similarity:.2f})" if isinstance(similarity, (int, float)) else ""
+            if snippets:
+                LOG.info(
+                    "Focused %s override%s for %s item '%s': %s",
+                    scope_label,
+                    similarity_note,
+                    receipt_label,
+                    name,
+                    "; ".join(snippets),
+                )
+    else:
+        LOG.info("Focused %s overrides evaluated %s but no fields changed.", _focus_scope_label(focus_scope), receipt_label)
+
+    LOG.info(
+        "Focused %s refinement completed: %s updated, %s unmatched, %s unchanged matches",
+        _focus_scope_label(focus_scope),
+        summary["updated_items"],
+        summary["unmatched_entries"],
+        summary["unchanged_matches"],
+    )
 
 def extract_receipt_payload_from_image(
     source_path: str,
@@ -1665,7 +2673,7 @@ def _extract_with_openrouter(
     """
     api_key = load_openrouter(script_dir or os.getcwd())
     if not api_key:
-        LOG.error("OPEN_ROUTER_API_KEY missing in env/.env; cannot run extraction")
+        LOG.error("OPENROUTER_API_KEY missing in env/.env; cannot run extraction")
         return None
 
     effective_model = (model_name or "").strip()
@@ -1678,6 +2686,7 @@ def _extract_with_openrouter(
         return None
 
     facts = FileFacts.from_dict(_file_facts(source_path))
+    response_store = ModelResponseStore(script_dir=script_dir, facts=facts)
     content_node = _openrouter_content_node(data_url, facts)
     plugins = _openrouter_plugins_for_mime(facts.mime_type)
     prompt = _prompt()
@@ -1691,21 +2700,52 @@ def _extract_with_openrouter(
         }
     ]
 
-    config = OpenRouterConfig(api_key=api_key, model_name=effective_model)
+    config = OpenRouterConfig(
+        api_key=api_key,
+        model_name=effective_model,
+        reasoning_effort=None,
+    )
     client = OpenRouterClient(config)
 
     LOG.info("Calling OpenRouter model=%s for structured extraction", effective_model)
-    parsed = client.json_request(
+    raw = client.json_request(
         messages,
         max_tokens=8000,
         timeout=180,
         plugins=plugins,
     )
-    if not isinstance(parsed, dict) or not parsed:
-        LOG.error("OpenRouter returned no valid JSON for structured extraction.")
+    if response_store and raw is not None:
+        response_store.write("raw_general", raw)
+    if not isinstance(raw, dict) or not raw:
+        LOG.error("OpenRouter returned no valid JSON object for structured extraction.")
         return None
 
-    normalized = _normalize_openrouter_payload(parsed, facts=facts)
+    normalized = _normalize_openrouter_payload(raw, facts=facts)
+    _apply_focused_updates(
+        normalized,
+        api_key=api_key,
+        model_name=effective_model,
+        data_url=data_url,
+        facts=facts,
+        plugins=plugins,
+        focus_scope="quantity",
+        allowed_fields=("quantity",),
+        enrichment_key="focused_quantity_overrides",
+        response_store=response_store,
+    )
+    _apply_focused_updates(
+        normalized,
+        api_key=api_key,
+        model_name=effective_model,
+        data_url=data_url,
+        facts=facts,
+        plugins=plugins,
+        focus_scope="tax_rate",
+        allowed_fields=("tax_rate",),
+        enrichment_key="focused_tax_overrides",
+        response_store=response_store,
+    )
+    PayloadNormalizer(facts).reconcile_after_overrides(normalized)
 
     address = (normalized.get("merchant") or {}).get("address") or {}
     context_for_country = {
@@ -1743,6 +2783,10 @@ def _extract_with_openrouter(
             "backend": "openrouter",
         },
     )
+
+    if response_store:
+        response_store.write("general", normalized)
+        response_store.write("final_normalized", normalized)
 
     LOG.info("OpenRouter extraction parsed and enriched successfully.")
     return normalized
