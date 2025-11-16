@@ -1,4 +1,4 @@
-I have these logs: [Pasted Content 4754 chars]
+
 
   Where everything is correct and as expected, but unfortunately I see in my receipt_items table in my db for the product BioBio Tomaten sort.400g still the quantity 2
   but in the logs I see the focused model got 1 and I see 2025-11-15 20:57:51 [productdb-extraction] INFO: Focused quantity override (match=1.00) for 2025-09-

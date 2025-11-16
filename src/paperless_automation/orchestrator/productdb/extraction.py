@@ -1245,7 +1245,10 @@ class PayloadNormalizer:
         for idx, candidate in enumerate(items):
             if not isinstance(candidate, dict):
                 continue
-            normalized = self._normalize_item(candidate)
+            normalized = self._normalize_item(
+                candidate,
+                allow_quantity_price_coupling=False,
+            )
             if not normalized:
                 LOG.warning(
                     "Focused reconciliation skipped item #%s (%r); original values kept.",
@@ -1253,10 +1256,86 @@ class PayloadNormalizer:
                     candidate.get("product_name") if isinstance(candidate, dict) else candidate,
                 )
                 continue
+            normalized = self._reconcile_quantity_price_consistency(normalized)
             items[idx].clear()
             items[idx].update(normalized)
         payload["items"] = items
         payload["totals"] = self._normalize_totals(payload.get("totals"), items)
+
+    def _reconcile_quantity_price_consistency(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        After focused quantity overrides, treat quantity as authoritative and adjust
+        either line_gross or unit_price_gross (whichever needs the smaller relative
+        change) to keep them consistent with that quantity.
+        """
+        qty_raw = item.get("quantity")
+        line_gross = item.get("line_gross")
+        unit_price_gross = item.get("unit_price_gross")
+        tax_rate = item.get("tax_rate")
+
+        try:
+            quantity = float(qty_raw) if qty_raw is not None else None
+        except (TypeError, ValueError):
+            quantity = None
+
+        if quantity is None or quantity <= 0:
+            return item
+        if not isinstance(line_gross, int) or not isinstance(unit_price_gross, int):
+            return item
+
+        quantity_int = max(1, int(round(quantity)))
+        abs_line = abs(line_gross)
+        abs_unit = abs(unit_price_gross)
+        if abs_line == 0 or abs_unit == 0:
+            return item
+
+        candidate_line = quantity_int * abs_unit
+        try:
+            candidate_unit_dec = Decimal(abs_line) / Decimal(quantity_int)
+        except InvalidOperation:
+            return item
+        candidate_unit = int(self._round_half_up(candidate_unit_dec))
+
+        delta_line = abs(candidate_line - abs_line) / max(abs_line, 1)
+        delta_unit = abs(candidate_unit - abs_unit) / max(abs_unit, 1)
+        if min(delta_line, delta_unit) > 0.51:
+            return item
+
+        reconciled_line = line_gross
+        reconciled_unit = unit_price_gross
+        changed = False
+        if delta_line <= delta_unit:
+            reconciled_line = candidate_line if line_gross >= 0 else -candidate_line
+            if reconciled_line != line_gross:
+                LOG.debug(
+                    "Reconciling line_gross for '%s' from %s to %s using qty=%s and unit_price_gross=%s",
+                    item.get("product_name"),
+                    line_gross,
+                    reconciled_line,
+                    quantity_int,
+                    unit_price_gross,
+                )
+                changed = True
+        else:
+            if candidate_unit != unit_price_gross:
+                LOG.debug(
+                    "Reconciling unit_price_gross for '%s' from %s to %s using qty=%s and line_gross=%s",
+                    item.get("product_name"),
+                    unit_price_gross,
+                    candidate_unit,
+                    quantity_int,
+                    line_gross,
+                )
+                reconciled_unit = candidate_unit
+                changed = True
+
+        item["line_gross"] = reconciled_line
+        item["unit_price_gross"] = reconciled_unit
+        if changed:
+            net, tax = self._compute_net_and_tax(reconciled_line, float(tax_rate) if tax_rate is not None else 0.19)
+            item["line_net"] = net
+            item["line_tax"] = tax
+        return item
 
     def _normalize_line_type(
         self,
@@ -1286,7 +1365,12 @@ class PayloadNormalizer:
 
         return LINE_TYPE_DEFAULT
 
-    def _normalize_item(self, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _normalize_item(
+        self,
+        item: Dict[str, Any],
+        *,
+        allow_quantity_price_coupling: bool = True,
+    ) -> Optional[Dict[str, Any]]:
         name = self._text(
             item.get("product_name") or item.get("name") or item.get("description")
         )
@@ -1311,26 +1395,27 @@ class PayloadNormalizer:
         )
         raw_unit_price_gross = self._coerce_int_cents(item.get("unit_price_gross"))
 
-        if (
-            raw_unit_price_gross is not None
-            and line_gross is not None
-            and quantity > 1.0
-            and abs(line_gross) == abs(raw_unit_price_gross)
-        ):
-            corrected_gross = int(abs(raw_unit_price_gross) * quantity)
-            if line_gross < 0:
-                corrected_gross *= -1
-            LOG.debug(
-                "Correcting line_gross for '%s' from %s to %s using quantity %.2f and unit_price_gross %s",
-                name,
-                line_gross,
-                corrected_gross,
-                quantity,
-                raw_unit_price_gross,
-            )
-            line_gross = corrected_gross
-            line_net = None
-            line_tax = None
+        if allow_quantity_price_coupling:
+            if (
+                raw_unit_price_gross is not None
+                and line_gross is not None
+                and quantity > 1.0
+                and abs(line_gross) == abs(raw_unit_price_gross)
+            ):
+                corrected_gross = int(abs(raw_unit_price_gross) * quantity)
+                if line_gross < 0:
+                    corrected_gross *= -1
+                LOG.debug(
+                    "Correcting line_gross for '%s' from %s to %s using quantity %.2f and unit_price_gross %s",
+                    name,
+                    line_gross,
+                    corrected_gross,
+                    quantity,
+                    raw_unit_price_gross,
+                )
+                line_gross = corrected_gross
+                line_net = None
+                line_tax = None
 
         if line_net is None or line_tax is None:
             computed_net, computed_tax = self._compute_net_and_tax(line_gross, tax_rate)
@@ -1369,12 +1454,13 @@ class PayloadNormalizer:
         if unit_price_net is None:
             unit_price_net = self._compute_unit_value(line_net, quantity)
 
-        quantity = self._adjust_quantity_from_unit_price(
-            quantity=quantity,
-            raw_unit_price_gross=raw_unit_price_gross,
-            line_gross=line_gross,
-            item_name=name,
-        )
+        if allow_quantity_price_coupling:
+            quantity = self._adjust_quantity_from_unit_price(
+                quantity=quantity,
+                raw_unit_price_gross=raw_unit_price_gross,
+                line_gross=line_gross,
+                item_name=name,
+            )
 
         normalized = {
             "product_name": name,
@@ -1894,6 +1980,26 @@ def _normalize_focus_rows(raw: Any) -> List[Dict[str, Any]]:
     return normalized
 
 
+# ---- raw-content aware helpers ---------------------------------------------------
+_MULT_RE = re.compile(r"(?P<qty>\d+)\s*[x×]\s*(?P<unit>\d+[.,]\d{2})", re.IGNORECASE)
+_PRICE_RE = re.compile(r"(?P<price>\d+[.,]\d{2})")
+
+
+def _price_to_cents(text_value: str) -> Optional[int]:
+    if not isinstance(text_value, str):
+        return None
+    cleaned = text_value.strip().replace(".", "").replace(",", ".")
+    try:
+        value = Decimal(cleaned)
+    except Exception:
+        return None
+    try:
+        cents = int((value * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    except Exception:
+        return None
+    return cents
+
+
 def _normalize_name_for_match(name: str) -> str:
     if not isinstance(name, str):
         return ""
@@ -1924,6 +2030,107 @@ def _match_item_index(items: List[str], candidate_name: str, *, threshold: float
     if best_idx is not None and best_score >= threshold:
         return best_idx, best_score
     return None, best_score
+
+
+def strengthen_with_raw_text(normalized: Dict[str, Any]) -> None:
+    """
+    Use raw_content text (when available) to repair quantity/unit/line_gross pairs
+    by re-parsing multiplier + total patterns commonly seen on Aldi/Netto receipts.
+    """
+    raw_content = normalized.get("raw_content")
+    if not isinstance(raw_content, str) or not raw_content.strip():
+        return
+
+    LOG.info("raw_content (verbatim):\n%s", raw_content)
+
+    lines = [ln.strip() for ln in raw_content.splitlines() if ln.strip()]
+    if not lines:
+        return
+
+    normalized_lines = [_normalize_name_for_match(ln) for ln in lines]
+    items = normalized.get("items")
+    if not isinstance(items, list):
+        return
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("product_name") or ""
+        idx, score = _match_item_index(normalized_lines, name, threshold=0.6)
+        if idx is None:
+            continue
+
+        line_text = lines[idx]
+        price_matches = _PRICE_RE.findall(line_text)
+        if not price_matches:
+            continue
+        row_total = _price_to_cents(price_matches[-1])
+        if row_total is None:
+            continue
+
+        prev_text = lines[idx - 1] if idx > 0 else ""
+        mult_match = _MULT_RE.search(prev_text)
+        updated = False
+
+        if mult_match:
+            try:
+                mult_qty = int(mult_match.group("qty"))
+            except Exception:
+                mult_qty = None
+            mult_unit = _price_to_cents(mult_match.group("unit"))
+            if mult_qty and mult_unit:
+                expected_total = mult_qty * mult_unit
+                if abs(expected_total - row_total) <= 1:
+                    item["quantity"] = float(mult_qty)
+                    item["unit_price_gross"] = mult_unit
+                    item["line_gross"] = row_total
+                    net, tax = PayloadNormalizer._compute_net_and_tax(
+                        row_total,
+                        float(item.get("tax_rate") or 0.19),
+                    )
+                    item["line_net"] = net
+                    item["line_tax"] = tax
+                    updated = True
+
+        if updated:
+            continue
+
+        qty_val = item.get("quantity")
+        try:
+            qty_int = int(round(float(qty_val))) if qty_val is not None else None
+        except Exception:
+            qty_int = None
+
+        if qty_int == 1:
+            if item.get("line_gross") != row_total:
+                item["line_gross"] = row_total
+                net, tax = PayloadNormalizer._compute_net_and_tax(
+                    row_total,
+                    float(item.get("tax_rate") or 0.19),
+                )
+                item["line_net"] = net
+                item["line_tax"] = tax
+            if item.get("unit_price_gross") in (None, 0):
+                item["unit_price_gross"] = row_total
+
+
+def check_totals_consistency(normalized: Dict[str, Any]) -> None:
+    items = normalized.get("items")
+    totals = normalized.get("totals")
+    if not isinstance(items, list) or not isinstance(totals, dict):
+        return
+    sum_items = sum(it.get("line_gross") or 0 for it in items if isinstance(it, dict))
+    total_gross = totals.get("total_gross")
+    if isinstance(total_gross, int) and abs(sum_items - total_gross) > 3:
+        normalized.setdefault("_enrichment", {})["totals_mismatch"] = {
+            "sum_items": sum_items,
+            "total_gross": total_gross,
+        }
+        LOG.warning(
+            "Totals mismatch detected: sum of line_gross=%s vs total_gross=%s",
+            sum_items,
+            total_gross,
+        )
 
 
 def apply_focused_quantity_tax_overrides(
@@ -2745,7 +2952,16 @@ def _extract_with_openrouter(
         enrichment_key="focused_tax_overrides",
         response_store=response_store,
     )
+    enrichment = normalized.setdefault("_enrichment", {})
+    if not normalized.get("raw_content"):
+        LOG.info("raw_content missing; requesting transcription via OpenRouter.")
+        raw_text = client.fetch_raw_content(data_url, facts=facts)
+        if raw_text:
+            normalized["raw_content"] = raw_text
+        enrichment["raw_content_fetched"] = bool(raw_text)
     PayloadNormalizer(facts).reconcile_after_overrides(normalized)
+    strengthen_with_raw_text(normalized)
+    check_totals_consistency(normalized)
 
     address = (normalized.get("merchant") or {}).get("address") or {}
     context_for_country = {
@@ -2754,8 +2970,6 @@ def _extract_with_openrouter(
         "city": address.get("city"),
         "postal_code": address.get("postal_code"),
     }
-
-    enrichment = normalized.setdefault("_enrichment", {})
 
     if not address.get("country"):
         LOG.info("Country missing; invoking OpenRouter guess helper.")
@@ -2767,13 +2981,6 @@ def _extract_with_openrouter(
         if guessed_country:
             address["country"] = guessed_country
         enrichment["guessed_country"] = guessed_country
-
-    if not normalized.get("raw_content"):
-        LOG.info("raw_content missing; requesting transcription via OpenRouter.")
-        raw_text = client.fetch_raw_content(data_url, facts=facts)
-        if raw_text:
-            normalized["raw_content"] = raw_text
-        enrichment["raw_content_fetched"] = bool(raw_text)
 
     normalized.setdefault(
         "_extraction_meta",
