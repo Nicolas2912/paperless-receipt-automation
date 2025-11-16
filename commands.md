@@ -28,3 +28,9 @@ python -m paperless_automation productdb ingest
 python -m paperless_automation productdb init
 ```
 
+# Running frontend
+
+```bash
+python -m paperless_automation productdb serve --host 127.0.0.1 --port 8001
+```
+

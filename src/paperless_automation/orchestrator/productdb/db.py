@@ -111,6 +111,10 @@ CREATE INDEX IF NOT EXISTS idx_receipts_merchant_dt ON receipts(merchant_id, pur
 CREATE INDEX IF NOT EXISTS idx_items_receipt        ON receipt_items(receipt_id);
 CREATE INDEX IF NOT EXISTS idx_items_taxrate        ON receipt_items(tax_rate);
 CREATE INDEX IF NOT EXISTS idx_merchants_name       ON merchants(name);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_merchants_name_address_norm ON merchants(
+  LOWER(TRIM(name)),
+  COALESCE(address_id, -1)
+);
 """
 
 
@@ -162,6 +166,7 @@ class ProductDatabase:
             self._migrate_extraction_runs_drop_prompt_version(conn)
             self._migrate_receipt_items_line_types(conn)
             self._deduplicate_addresses(conn)
+            self._deduplicate_merchants(conn)
             cur.executescript(SCHEMA_SQL)
             conn.commit()
             LOG.info("Product DB schema ensured.")
@@ -378,6 +383,49 @@ class ProductDatabase:
             )
         conn.commit()
 
+    def _deduplicate_merchants(self, conn: sqlite3.Connection) -> None:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='merchants';"
+        )
+        if cur.fetchone() is None:
+            return
+
+        cur.execute("SELECT merchant_id, name, address_id FROM merchants ORDER BY merchant_id;")
+        rows = cur.fetchall()
+        seen: Dict[str, Dict[str, Optional[int]]] = {}
+        for row in rows:
+            normalized_name = self._normalize_merchant_name(row["name"])
+            if normalized_name is None:
+                continue
+            if normalized_name != row["name"]:
+                cur.execute(
+                    "UPDATE merchants SET name = ? WHERE merchant_id = ?;",
+                    (normalized_name, row["merchant_id"]),
+                )
+            key = normalized_name.lower()
+            canonical = seen.get(key)
+            if canonical is None:
+                seen[key] = {"merchant_id": row["merchant_id"], "address_id": row["address_id"]}
+                continue
+            canonical_id = canonical["merchant_id"]
+            canonical_address_id = canonical["address_id"]
+            current_address_id = row["address_id"]
+
+            # Prefer retaining a known address when collapsing duplicates
+            if canonical_address_id is None and current_address_id is not None:
+                cur.execute(
+                    "UPDATE merchants SET address_id = ? WHERE merchant_id = ?;",
+                    (current_address_id, canonical_id),
+                )
+                canonical["address_id"] = current_address_id
+            cur.execute(
+                "UPDATE OR IGNORE receipts SET merchant_id = ? WHERE merchant_id = ?;",
+                (canonical_id, row["merchant_id"]),
+            )
+            cur.execute("DELETE FROM merchants WHERE merchant_id = ?;", (row["merchant_id"],))
+        conn.commit()
+
     # --------------- Insert/Upsert helpers ---------------
     def insert_address(self, addr: Dict[str, Optional[str]]) -> Optional[int]:
         normalized = self._normalize_address_fields(addr)
@@ -415,8 +463,31 @@ class ProductDatabase:
             return int(new_row[0])
 
     def upsert_merchant(self, name: str, address_id: Optional[int]) -> int:
+        normalized_name = self._normalize_merchant_name(name)
+        if normalized_name is None:
+            raise ValueError("Merchant name is required for upsert_merchant.")
         with self.connect() as conn:
             cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT merchant_id, address_id
+                FROM merchants
+                WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))
+                LIMIT 1;
+                """,
+                (normalized_name,),
+            )
+            existing = cur.fetchone()
+            if existing:
+                merchant_id = int(existing["merchant_id"])
+                existing_address_id = existing["address_id"]
+                if existing_address_id is None and address_id is not None:
+                    cur.execute(
+                        "UPDATE merchants SET address_id = ? WHERE merchant_id = ?;",
+                        (address_id, merchant_id),
+                    )
+                conn.commit()
+                return merchant_id
             cur.execute(
                 """
                 INSERT INTO merchants (name, address_id)
@@ -424,7 +495,7 @@ class ProductDatabase:
                 ON CONFLICT(name, address_id) DO UPDATE SET name=excluded.name
                 RETURNING merchant_id;
                 """,
-                (name, address_id),
+                (normalized_name, address_id),
             )
             row = cur.fetchone()
             conn.commit()
@@ -580,6 +651,13 @@ class ProductDatabase:
         if not any((street, city, postal_code, country)):
             return None
         return street, city, postal_code, country
+
+    @staticmethod
+    def _normalize_merchant_name(name: Optional[str]) -> Optional[str]:
+        if name is None:
+            return None
+        cleaned = " ".join(str(name).strip().split())
+        return cleaned if cleaned else None
 
     @staticmethod
     def _address_key(
