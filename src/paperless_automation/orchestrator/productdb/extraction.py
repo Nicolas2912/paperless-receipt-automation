@@ -299,57 +299,47 @@ class OpenRouterConfig:
     reasoning_effort: Optional[str] = None
 
 
-# ---------- prompt & schema (your originals) ----------
+# ---------- prompt & schema ----------
 def _prompt() -> str:
     return """
 ## Task
-Extract data from a retail image or PDF of a receipt. Read very carefully and capture every product (food and non-food) and Pfand line. When uncertain, still include the line as an item with your best transcription; set numeric fields you cannot read confidently to null instead of skipping the item.
-Read line by line to get every product (food and non-food) and Pfand lines but not something like "SUMME" or "KARTENZAHLUNG" etc. ONLY real products!
+Extract data from a retail receipt image/PDF. Your job is to segment items, name them, and copy the printed row totals exactly. Do NOT do arithmetic: do not multiply, divide, or estimate any prices. Provide the raw transcript so post-processing can do the math.
 
 ## Output (strict)
 Return ONLY strict JSON (no code fences, no commentary).
-The top-level object MUST have exactly these keys (no more, no less):
-- merchant
-- date
-- currency
-- payment_method
-- items
+Top-level keys:
+- merchant (object)
+- purchase_date_time (string ISO or null)
+- currency (string, e.g., "EUR")
+- payment_method (string)
+- totals (object with total_gross optional)
+- raw_content (string, REQUIRED; full transcription, line order preserved)
+- items (array)
 
-### Schema: items
-Each line item must include:
-- description: string (raw text from the receipt line)
-- quantity: integer (>= 1), always positive
-- unit_price_net: integer|null (cents, per unit; NOT the row total)
-- unit_price_gross: integer|null (cents, per unit; NOT the row total)
-- line_net: integer (cents); sign-preserving (see rules)
-- line_gross: integer (cents); sign-preserving (see rules)
-- vat_rate: number|null
-- line_type: enum { NORMAL, DEPOSIT_CHARGE, DEPOSIT_REFUND }
+### Schema: items (MINIMAL)
+Each item MUST have:
+- product_name: string (best transcription of the product line)
+- line_index: integer (0-based index of the product line inside `raw_content` lines; required)
+- line_gross: integer (cents), sign-preserving, copied exactly from the printed ROW TOTAL on that line (not multiplied)
+- tax_rate: number OR tax_group: string ("A"|"B" etc). At least one of tax_rate/tax_group must be present.
+- line_type: enum { SALE|DEPOSIT_CHARGE|DEPOSIT_REFUND } (optional if unclear; set null if unknown)
 
-### Unit price vs row total (CRITICAL)
-If a line shows both a unit price and a row total, then:
-- unit_price_gross = unit price per piece (cents)
-- line_gross = quantity × unit_price_gross (row total in cents)
+May include (optional):
+- unit_price_gross: integer (cents) ONLY if it is explicitly printed on the same product line.
 
-Example:
-- "Pfandtasche 4 A 0,50 € 2,00 € *"
-  → quantity = 4
-  → unit_price_gross = 50   (0,50 €)
-  → line_gross = 200        (2,00 €)
+Do NOT include:
+- quantity
+- unit_price_net
+- line_net
+- line_tax
 
-Example Netto and ALDI layout:
-- Line 1: "TOMATEN"
-- Line 2: "2x 1,39"
-- Line 3: "Zwiebeln 1,39 €"
+### Row total vs multipliers (CRITICAL)
+- If you see a multiplier like "2 x 1,09 €" ABOVE the product (Aldi/Netto layout), still set line_gross to the printed ROW TOTAL on the product line (e.g., "2,18").
+- If you see "2 x 1,09" INSIDE the product block (IKEA/Famila style), set line_gross to the printed ROW TOTAL. Do NOT multiply yourself.
+- Never infer or multiply quantities; just copy the printed row total price.
 
-You must output ONE item for SKYR:
-- description = "Zwiebeln 1,39 €"
-- quantity = 2
-- unit_price_gross = 139  (1,39 €)
-- line_gross = 278        (2 × 1,39 €)
-
-Tomaten stays quantity = 1 unless its own multiplier is printed.
-Netto and ALDI layout rule: a standalone multiplier line like "2x 1,39" belongs to the next product line below it, not the one above.
+### raw_content (REQUIRED)
+Provide the full transcription in order, as a single string with newlines. Keep every line (including multipliers, weights, totals headers).
 
 ### Token cues for Pfand classification
 Use case-insensitive matching; treat hyphens/whitespace/umlauts equivalently.
@@ -1870,7 +1860,7 @@ class OpenRouterClient:
 
     def fetch_raw_content(self, data_url: str, *, facts: FileFacts) -> Optional[str]:
         prompt = (
-            "Transcribe the receipt exactly as text, preserving line order. "
+            "Transcribe the receipt exactly as text, preserving line order, spacing, tabs etc.. "
             "Return strict JSON with key 'raw_content' containing the transcription."
         )
         content_node = _openrouter_content_node(data_url, facts)
@@ -1981,23 +1971,17 @@ def _normalize_focus_rows(raw: Any) -> List[Dict[str, Any]]:
 
 
 # ---- raw-content aware helpers ---------------------------------------------------
-_MULT_RE = re.compile(r"(?P<qty>\d+)\s*[x×]\s*(?P<unit>\d+[.,]\d{2})", re.IGNORECASE)
-_PRICE_RE = re.compile(r"(?P<price>\d+[.,]\d{2})")
-
-
-def _price_to_cents(text_value: str) -> Optional[int]:
-    if not isinstance(text_value, str):
-        return None
-    cleaned = text_value.strip().replace(".", "").replace(",", ".")
-    try:
-        value = Decimal(cleaned)
-    except Exception:
-        return None
-    try:
-        cents = int((value * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-    except Exception:
-        return None
-    return cents
+_RAW_TOTAL_TOKENS: Tuple[str, ...] = (
+    "summe",
+    "gesamt",
+    "total",
+    "zwischensumme",
+    "endbetrag",
+    "zu zahlen",
+    "sumne",
+)
+_RAW_PFAND_KEYWORDS: Tuple[str, ...] = ("pfand", "ew-pfand", "einwegpfand", "mehrwegpfand", "mw-pfand", "leergut", "einweg", "mehrweg")
+_RAW_STORE_HEADER_LINES = 8
 
 
 def _normalize_name_for_match(name: str) -> str:
@@ -2032,86 +2016,209 @@ def _match_item_index(items: List[str], candidate_name: str, *, threshold: float
     return None, best_score
 
 
-def strengthen_with_raw_text(normalized: Dict[str, Any]) -> None:
+def _raw_content_is_total(text: str) -> bool:
+    if PayloadNormalizer._looks_like_total_header(text):
+        return True
+    lowered = (text or "").lower()
+    return any(token in lowered for token in _RAW_TOTAL_TOKENS)
+
+
+def _raw_is_pfand_line(name: str) -> bool:
+    lowered = (name or "").lower()
+    return any(keyword in lowered for keyword in _RAW_PFAND_KEYWORDS)
+
+
+def _detect_store(raw_content: str) -> str:
+    header = " ".join(
+        line.strip() for line in raw_content.splitlines()[:_RAW_STORE_HEADER_LINES] if line.strip()
+    ).lower()
+    if "aldi" in header:
+        return "aldi"
+    if "netto" in header:
+        return "netto"
+    return "other"
+
+
+def _cents_from_str(amount_str: str) -> Optional[int]:
+    if not isinstance(amount_str, str):
+        return None
+    cleaned = amount_str.strip().replace("€", "").strip()
+    if not cleaned:
+        return None
+    if "," in cleaned:
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+    elif cleaned.count(".") > 1:
+        parts = cleaned.split(".")
+        cleaned = "".join(parts[:-1]) + "." + parts[-1]
+    try:
+        cents_dec = (Decimal(cleaned) * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    except Exception:
+        return None
+    try:
+        return int(cents_dec)
+    except Exception:
+        return None
+
+
+def _rightmost_price(text: str) -> Optional[int]:
+    matches = re.findall(r"\d+[.,]\d{2}", text or "")
+    if not matches:
+        return None
+    return _cents_from_str(matches[-1])
+
+
+def _tax_from_group(group: Any) -> Optional[float]:
+    if not isinstance(group, str):
+        return None
+    upper = group.strip().upper()
+    if upper == "A":
+        return 0.19
+    if upper == "B":
+        return 0.07
+    return None
+
+
+def parse_items_from_raw_content(
+    raw_content: str,
+    base_items: Optional[List[Dict[str, Any]]] = None,
+    *,
+    merchant_name: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """
-    Use raw_content text (when available) to repair quantity/unit/line_gross pairs
-    by re-parsing multiplier + total patterns commonly seen on Aldi/Netto receipts.
+    Deterministically reconstruct quantities/unit prices using raw_content and seed items.
+    Seed items supply product_name/line_gross/tax_rate/line_type/line_index from the model.
     """
-    raw_content = normalized.get("raw_content")
     if not isinstance(raw_content, str) or not raw_content.strip():
-        return
+        return []
 
-    LOG.info("raw_content (verbatim):\n%s", raw_content)
-
-    lines = [ln.strip() for ln in raw_content.splitlines() if ln.strip()]
+    lines = [ln.strip() for ln in raw_content.splitlines() if ln is not None]
+    lines = [ln for ln in lines if ln.strip()]
     if not lines:
-        return
+        return []
 
+    store = _detect_store(raw_content)
     normalized_lines = [_normalize_name_for_match(ln) for ln in lines]
-    items = normalized.get("items")
-    if not isinstance(items, list):
-        return
+    items_to_process = base_items or []
 
-    for item in items:
-        if not isinstance(item, dict):
+    def _anchor_index(item: Dict[str, Any]) -> Optional[int]:
+        idx = item.get("line_index")
+        if isinstance(idx, int) and 0 <= idx < len(lines):
+            return idx
+        name = item.get("product_name") or item.get("description") or ""
+        match_idx, score = _match_item_index(normalized_lines, name, threshold=0.6)
+        return match_idx
+
+    def _find_multiplier(anchor: int) -> Tuple[Optional[int], Optional[int]]:
+        """Return (qty, unit_price_gross) if a supporting multiplier is nearby."""
+        anchor_line = lines[anchor]
+        match_same = re.search(r"(\d+)\s*[x×]\s*(\d+[.,]\d{2})", anchor_line)
+        if match_same:
+            return int(match_same.group(1)), _cents_from_str(match_same.group(2))
+
+        offsets = [1] if store in {"aldi", "netto"} else [1, 2]
+        for offset in offsets:
+            if anchor - offset < 0:
+                continue
+            candidate = lines[anchor - offset]
+            mult = re.search(r"(\d+)\s*[x×]\s*(\d+[.,]\d{2})", candidate)
+            if mult:
+                return int(mult.group(1)), _cents_from_str(mult.group(2))
+
+        # Netto/Aldi split pattern: line-2 "2 x" and line-1 "1,49"
+        if store in {"aldi", "netto"} and anchor >= 2:
+            qty_line = lines[anchor - 2]
+            price_line = lines[anchor - 1]
+            m_qty = re.match(r"^\s*(\d+)\s*[x×]\s*$", qty_line)
+            m_price = re.match(r"^\s*(\d+[.,]\d{2})\s*(?:€)?\s*$", price_line)
+            if m_qty and m_price:
+                qty_val = int(m_qty.group(1))
+                price_val = _cents_from_str(m_price.group(1))
+                if price_val is not None:
+                    return qty_val, price_val
+        return None, None
+
+    results: List[Dict[str, Any]] = []
+    for seed in items_to_process:
+        if not isinstance(seed, dict):
             continue
-        name = item.get("product_name") or ""
-        idx, score = _match_item_index(normalized_lines, name, threshold=0.6)
-        if idx is None:
+        anchor = _anchor_index(seed)
+        if anchor is None:
             continue
 
-        line_text = lines[idx]
-        price_matches = _PRICE_RE.findall(line_text)
-        if not price_matches:
-            continue
-        row_total = _price_to_cents(price_matches[-1])
+        anchor_text = lines[anchor]
+        name = seed.get("product_name") or anchor_text
+        base_line_gross = seed.get("line_gross") if isinstance(seed.get("line_gross"), int) else None
+        row_total = base_line_gross if base_line_gross is not None else _rightmost_price(anchor_text)
         if row_total is None:
             continue
 
-        prev_text = lines[idx - 1] if idx > 0 else ""
-        mult_match = _MULT_RE.search(prev_text)
-        updated = False
+        qty, unit_price_candidate = _find_multiplier(anchor)
+        quantity = float(qty) if qty and unit_price_candidate else 1.0
+        unit_price_gross = (
+            unit_price_candidate
+            if qty and unit_price_candidate and abs(qty * unit_price_candidate - abs(row_total)) <= 1
+            else int(abs(row_total))
+        )
 
-        if mult_match:
-            try:
-                mult_qty = int(mult_match.group("qty"))
-            except Exception:
-                mult_qty = None
-            mult_unit = _price_to_cents(mult_match.group("unit"))
-            if mult_qty and mult_unit:
-                expected_total = mult_qty * mult_unit
-                if abs(expected_total - row_total) <= 1:
-                    item["quantity"] = float(mult_qty)
-                    item["unit_price_gross"] = mult_unit
-                    item["line_gross"] = row_total
-                    net, tax = PayloadNormalizer._compute_net_and_tax(
-                        row_total,
-                        float(item.get("tax_rate") or 0.19),
-                    )
-                    item["line_net"] = net
-                    item["line_tax"] = tax
-                    updated = True
+        tax_rate = PayloadNormalizer._normalize_tax_rate(seed.get("tax_rate")) if seed.get("tax_rate") is not None else None
+        if tax_rate is None:
+            tax_rate = _tax_from_group(seed.get("tax_group")) or 0.19
 
-        if updated:
-            continue
+        line_type = seed.get("line_type")
+        if not line_type:
+            line_type = LINE_TYPE_DEPOSIT_CHARGE if _raw_is_pfand_line(name or anchor_text) else LINE_TYPE_DEFAULT
 
-        qty_val = item.get("quantity")
-        try:
-            qty_int = int(round(float(qty_val))) if qty_val is not None else None
-        except Exception:
-            qty_int = None
+        line_net, line_tax = PayloadNormalizer._compute_net_and_tax(row_total, tax_rate)
+        unit_price_net = (
+            int(round(line_net / quantity)) if line_net is not None and quantity > 0 else line_net
+        )
 
-        if qty_int == 1:
-            if item.get("line_gross") != row_total:
-                item["line_gross"] = row_total
-                net, tax = PayloadNormalizer._compute_net_and_tax(
-                    row_total,
-                    float(item.get("tax_rate") or 0.19),
-                )
-                item["line_net"] = net
-                item["line_tax"] = tax
-            if item.get("unit_price_gross") in (None, 0):
-                item["unit_price_gross"] = row_total
+        results.append(
+            {
+                "product_name": name,
+                "quantity": quantity,
+                "unit_price_net": unit_price_net,
+                "unit_price_gross": unit_price_gross,
+                "tax_rate": float(tax_rate),
+                "line_net": line_net,
+                "line_tax": line_tax,
+                "line_gross": row_total,
+                "line_type": line_type,
+                "line_index": anchor,
+            }
+        )
+
+    if results:
+        return results
+
+    # Fallback: try to parse raw_content directly if no seed items worked
+    return []
+
+
+def strengthen_with_raw_text(normalized: Dict[str, Any], *, facts: Optional[FileFacts] = None) -> None:
+    """Deterministically rebuild items from raw_content and model-provided row totals."""
+    raw_content = normalized.get("raw_content")
+    if isinstance(raw_content, str) and raw_content.strip():
+        LOG.info("raw_content (verbatim):\n%s", raw_content)
+    base_items = normalized.get("items") if isinstance(normalized.get("items"), list) else []
+    merchant = (normalized.get("merchant") or {}).get("name")
+    parsed_items = parse_items_from_raw_content(raw_content, base_items, merchant_name=merchant)
+    # Only adopt deterministic parsing if we actually changed any quantities (qty > 1)
+    if parsed_items and any(isinstance(it, dict) and it.get("quantity", 1) and it.get("quantity", 1) > 1 for it in parsed_items):
+        LOG.info("raw_content parser produced %s items using store-aware heuristics.", len(parsed_items))
+        normalized["items"] = parsed_items
+
+        source_file = normalized.get("source_file") if isinstance(normalized.get("source_file"), dict) else {}
+        fallback_facts = facts or (FileFacts.from_dict(source_file) if isinstance(source_file, dict) else None)
+        normalizer = PayloadNormalizer(fallback_facts or FileFacts(None, None, None, None))
+        normalized["totals"] = normalizer._normalize_totals(normalized.get("totals"), parsed_items)
+        return
+
+    if not parsed_items:
+        LOG.debug("raw_content parser returned no items; keeping existing normalized items.")
+        return
+
+    LOG.debug("raw_content parser found only qty=1 items; keeping existing normalized items.")
 
 
 def check_totals_consistency(normalized: Dict[str, Any]) -> None:
@@ -2928,30 +3035,6 @@ def _extract_with_openrouter(
         return None
 
     normalized = _normalize_openrouter_payload(raw, facts=facts)
-    _apply_focused_updates(
-        normalized,
-        api_key=api_key,
-        model_name=effective_model,
-        data_url=data_url,
-        facts=facts,
-        plugins=plugins,
-        focus_scope="quantity",
-        allowed_fields=("quantity",),
-        enrichment_key="focused_quantity_overrides",
-        response_store=response_store,
-    )
-    _apply_focused_updates(
-        normalized,
-        api_key=api_key,
-        model_name=effective_model,
-        data_url=data_url,
-        facts=facts,
-        plugins=plugins,
-        focus_scope="tax_rate",
-        allowed_fields=("tax_rate",),
-        enrichment_key="focused_tax_overrides",
-        response_store=response_store,
-    )
     enrichment = normalized.setdefault("_enrichment", {})
     if not normalized.get("raw_content"):
         LOG.info("raw_content missing; requesting transcription via OpenRouter.")
@@ -2959,8 +3042,9 @@ def _extract_with_openrouter(
         if raw_text:
             normalized["raw_content"] = raw_text
         enrichment["raw_content_fetched"] = bool(raw_text)
+    strengthen_with_raw_text(normalized, facts=facts)
+    # Deterministic reconstruction based on raw_content + provided row totals
     PayloadNormalizer(facts).reconcile_after_overrides(normalized)
-    strengthen_with_raw_text(normalized)
     check_totals_consistency(normalized)
 
     address = (normalized.get("merchant") or {}).get("address") or {}
