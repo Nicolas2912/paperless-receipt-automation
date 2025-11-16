@@ -4,6 +4,33 @@ const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?
 
 type Direction = "asc" | "desc";
 
+export interface SummaryRange {
+  filters: {
+    date_from: string | null;
+    date_to: string | null;
+  };
+  counts: {
+    receipts: number;
+    receipt_items: number;
+    merchants: number;
+    addresses: number;
+  };
+  totals: {
+    total_net_cents: number;
+    total_tax_cents: number;
+    total_gross_cents: number;
+  };
+  timespan: {
+    first_purchase: string | null;
+    last_purchase: string | null;
+  };
+  daily_totals: Array<{
+    date: string;
+    total_gross_cents: number;
+    receipt_count: number;
+  }>;
+}
+
 export interface SummaryResponse {
   counts: Record<string, number>;
   totals: {
@@ -15,6 +42,7 @@ export interface SummaryResponse {
     first_purchase: string | null;
     last_purchase: string | null;
   };
+  range: SummaryRange;
 }
 
 export interface ReceiptOverviewItem {
@@ -119,8 +147,79 @@ const api = axios.create({
   timeout: 15_000
 });
 
-export const fetchSummary = async (): Promise<SummaryResponse> => {
-  const { data } = await api.get<SummaryResponse>("/summary");
+export interface SummaryFilters {
+  dateFrom?: string | null;
+  dateTo?: string | null;
+}
+
+export interface SpendTimeseriesPoint {
+  date: string;
+  total_gross_cents: number;
+  receipt_count: number;
+}
+
+export interface SpendTimeseriesResponse {
+  filters: {
+    date_from: string | null;
+    date_to: string | null;
+  };
+  points: SpendTimeseriesPoint[];
+}
+
+export interface MerchantSpendItem {
+  merchant_id: number;
+  merchant_name: string;
+  total_gross_cents: number;
+  receipt_count: number;
+}
+
+export interface MerchantSpendResponse {
+  filters: {
+    date_from: string | null;
+    date_to: string | null;
+  };
+  items: MerchantSpendItem[];
+}
+
+export const fetchSummary = async (filters: SummaryFilters = {}): Promise<SummaryResponse> => {
+  const params = new URLSearchParams();
+  if (filters.dateFrom) {
+    params.set("from", filters.dateFrom);
+  }
+  if (filters.dateTo) {
+    params.set("to", filters.dateTo);
+  }
+  const { data } = await api.get<SummaryResponse>("/summary", { params });
+  return data;
+};
+
+export const fetchSpendTimeseries = async (
+  filters: SummaryFilters = {}
+): Promise<SpendTimeseriesResponse> => {
+  const params = new URLSearchParams();
+  if (filters.dateFrom) {
+    params.set("from", filters.dateFrom);
+  }
+  if (filters.dateTo) {
+    params.set("to", filters.dateTo);
+  }
+  const { data } = await api.get<SpendTimeseriesResponse>("/timeseries/spend", { params });
+  return data;
+};
+
+export const fetchMerchantSpend = async (
+  filters: SummaryFilters = {},
+  limit = 8
+): Promise<MerchantSpendResponse> => {
+  const params = new URLSearchParams();
+  if (filters.dateFrom) {
+    params.set("from", filters.dateFrom);
+  }
+  if (filters.dateTo) {
+    params.set("to", filters.dateTo);
+  }
+  params.set("limit", String(limit));
+  const { data } = await api.get<MerchantSpendResponse>("/analytics/merchant_spend", { params });
   return data;
 };
 

@@ -68,8 +68,15 @@ def create_app(
     async def health(_: Request) -> JSONResponse:
         return JSONResponse({"status": "ok", "db_path": db.db_path})
 
-    async def summary(_: Request) -> JSONResponse:
-        return JSONResponse(db.fetch_summary())
+    async def summary(request: Request) -> JSONResponse:
+        qp = request.query_params
+        date_from = qp.get("from") or qp.get("date_from")
+        date_to = qp.get("to") or qp.get("date_to")
+        try:
+            payload = db.fetch_summary(date_from=date_from, date_to=date_to)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(payload)
 
     async def receipts(request: Request) -> JSONResponse:
         qp = request.query_params
@@ -107,6 +114,27 @@ def create_app(
     async def merchants(_: Request) -> JSONResponse:
         return JSONResponse({"items": db.fetch_merchants_overview()})
 
+    async def spend_timeseries(request: Request) -> JSONResponse:
+        qp = request.query_params
+        date_from = qp.get("from") or qp.get("date_from")
+        date_to = qp.get("to") or qp.get("date_to")
+        try:
+            payload = db.fetch_spend_timeseries(date_from=date_from, date_to=date_to)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(payload)
+
+    async def merchant_spend(request: Request) -> JSONResponse:
+        qp = request.query_params
+        date_from = qp.get("from") or qp.get("date_from")
+        date_to = qp.get("to") or qp.get("date_to")
+        limit = _parse_int(qp.get("limit"), default=10, minimum=1, maximum=100)
+        try:
+            payload = db.fetch_merchant_spend(date_from=date_from, date_to=date_to, limit=limit)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(payload)
+
     async def table_rows(request: Request) -> JSONResponse:
         table = request.path_params["table"]
         qp = request.query_params
@@ -124,6 +152,8 @@ def create_app(
         Route("/api/receipts", receipts, methods=["GET"]),
         Route("/api/receipts/{receipt_id:int}", receipt_detail, methods=["GET"]),
         Route("/api/merchants", merchants, methods=["GET"]),
+        Route("/api/timeseries/spend", spend_timeseries, methods=["GET"]),
+        Route("/api/analytics/merchant_spend", merchant_spend, methods=["GET"]),
         Route("/api/tables/{table:str}", table_rows, methods=["GET"]),
     ]
 

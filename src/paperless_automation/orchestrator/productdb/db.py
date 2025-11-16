@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from contextlib import contextmanager
+from datetime import date, datetime, timedelta
 from typing import Iterator, Optional, Dict, Any, List, Sequence, Tuple
 
 from ...logging import get_logger
@@ -680,8 +681,53 @@ class ProductDatabase:
     def _row_to_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
         return dict(row) if row is not None else None
 
-    def fetch_summary(self) -> Dict[str, Any]:
-        """Return high-level counts and total amounts for dashboard views."""
+    @staticmethod
+    def _coerce_date(raw: Optional[str]) -> Optional[date]:
+        """Parse YYYY-MM-DD/ISO-ish values to a date, returning None when empty."""
+        if raw is None:
+            return None
+        cleaned = str(raw).strip()
+        if not cleaned:
+            return None
+        # Allow YYYY-MM shorthand to mean first of that month
+        if len(cleaned) == 7 and "-" in cleaned:
+            cleaned = f"{cleaned}-01"
+        try:
+            parsed = datetime.fromisoformat(cleaned)
+        except ValueError as exc:
+            raise ValueError(f"Invalid date value: {raw!r}. Use YYYY-MM-DD.") from exc
+        return parsed.date()
+
+    @classmethod
+    def _date_filters(cls, date_from: Optional[str], date_to: Optional[str]) -> Tuple[str, List[Any], Dict[str, Optional[str]]]:
+        """Build WHERE clause, params, and normalised metadata for date filters."""
+        start_date = cls._coerce_date(date_from)
+        end_date = cls._coerce_date(date_to)
+        params: List[Any] = []
+        clauses: List[str] = []
+        if start_date:
+            clauses.append("r.purchase_date_time >= ?")
+            params.append(start_date.isoformat())
+        if end_date:
+            # use exclusive upper bound (next day) to make 'to' inclusive by date
+            exclusive_end = end_date + timedelta(days=1)
+            clauses.append("r.purchase_date_time < ?")
+            params.append(exclusive_end.isoformat())
+
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        metadata = {
+            "date_from": start_date.isoformat() if start_date else None,
+            "date_to": end_date.isoformat() if end_date else None,
+        }
+        return where_sql, params, metadata
+
+    def fetch_summary(self, *, date_from: Optional[str] = None, date_to: Optional[str] = None) -> Dict[str, Any]:
+        """Return high-level counts and total amounts for dashboard views.
+
+        When date filters are supplied, range-specific stats are returned under
+        the `range` key while the top-level values stay unfiltered for backward
+        compatibility.
+        """
         with self.connect() as conn:
             cur = conn.cursor()
             table_counts: Dict[str, int] = {}
@@ -723,6 +769,117 @@ class ProductDatabase:
             )
             span_row = cur.fetchone()
 
+            where_sql, params, filter_meta = self._date_filters(date_from, date_to)
+
+            cur.execute(
+                f"""
+                SELECT
+                    COALESCE(SUM(r.total_net), 0) AS total_net,
+                    COALESCE(SUM(r.total_tax), 0) AS total_tax,
+                    COALESCE(SUM(r.total_gross), 0) AS total_gross
+                FROM receipts r
+                {where_sql};
+                """,
+                params,
+            )
+            filtered_totals_row = cur.fetchone()
+            filtered_totals = {
+                "total_net_cents": int(filtered_totals_row["total_net"] or 0),
+                "total_tax_cents": int(filtered_totals_row["total_tax"] or 0),
+                "total_gross_cents": int(filtered_totals_row["total_gross"] or 0),
+            }
+
+            cur.execute(
+                f"""
+                SELECT
+                    MIN(r.purchase_date_time) AS first_purchase,
+                    MAX(r.purchase_date_time) AS last_purchase
+                FROM receipts r
+                {where_sql};
+                """,
+                params,
+            )
+            filtered_span = cur.fetchone()
+
+            cur.execute(
+                f"""
+                SELECT COUNT(*) AS count FROM receipts r
+                {where_sql};
+                """,
+                params,
+            )
+            filtered_receipt_count = int(cur.fetchone()["count"] or 0)
+
+            cur.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM receipt_items i
+                JOIN receipts r ON r.receipt_id = i.receipt_id
+                {where_sql};
+                """,
+                params,
+            )
+            filtered_item_count = int(cur.fetchone()["count"] or 0)
+
+            cur.execute(
+                f"""
+                SELECT COUNT(DISTINCT r.merchant_id) AS count
+                FROM receipts r
+                {where_sql};
+                """,
+                params,
+            )
+            filtered_merchant_count = int(cur.fetchone()["count"] or 0)
+
+            cur.execute(
+                f"""
+                SELECT COUNT(DISTINCT m.address_id) AS count
+                FROM receipts r
+                JOIN merchants m ON m.merchant_id = r.merchant_id
+                {where_sql};
+                """,
+                params,
+            )
+            filtered_address_count = int(cur.fetchone()["count"] or 0)
+
+            cur.execute(
+                f"""
+                SELECT
+                    DATE(r.purchase_date_time) AS purchase_date,
+                    SUM(COALESCE(r.total_gross, 0)) AS total_gross_cents,
+                    COUNT(*) AS receipt_count
+                FROM receipts r
+                {where_sql}
+                GROUP BY purchase_date
+                ORDER BY purchase_date ASC;
+                """,
+                params,
+            )
+            daily_totals = [
+                {
+                    "date": row["purchase_date"],
+                    "total_gross_cents": int(row["total_gross_cents"] or 0),
+                    "receipt_count": int(row["receipt_count"] or 0),
+                }
+                for row in cur.fetchall()
+            ]
+
+            range_summary = {
+                "filters": filter_meta,
+                "counts": {
+                    "receipts": filtered_receipt_count,
+                    "receipt_items": filtered_item_count,
+                    "merchants": filtered_merchant_count,
+                    "addresses": filtered_address_count,
+                },
+                "totals": filtered_totals,
+                "timespan": {
+                    "first_purchase": filtered_span["first_purchase"],
+                    "last_purchase": filtered_span["last_purchase"],
+                },
+                "daily_totals": daily_totals,
+            }
+
             return {
                 "counts": table_counts,
                 "totals": totals,
@@ -730,6 +887,7 @@ class ProductDatabase:
                     "first_purchase": span_row["first_purchase"],
                     "last_purchase": span_row["last_purchase"],
                 },
+                "range": range_summary,
             }
 
     def fetch_receipts_overview(
@@ -805,6 +963,70 @@ class ProductDatabase:
             rows = self._rows_to_dicts(cur.fetchall())
 
         return {"total": total, "items": rows, "limit": limit, "offset": offset}
+
+    def fetch_spend_timeseries(self, *, date_from: Optional[str] = None, date_to: Optional[str] = None) -> Dict[str, Any]:
+        """Return daily gross totals and receipt counts within an optional date range."""
+        where_sql, params, filter_meta = self._date_filters(date_from, date_to)
+        with self.connect() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"""
+                SELECT
+                    DATE(r.purchase_date_time) AS purchase_date,
+                    SUM(COALESCE(r.total_gross, 0)) AS total_gross_cents,
+                    COUNT(*) AS receipt_count
+                FROM receipts r
+                {where_sql}
+                GROUP BY purchase_date
+                ORDER BY purchase_date ASC;
+                """,
+                params,
+            )
+            timeseries = [
+                {
+                    "date": row["purchase_date"],
+                    "total_gross_cents": int(row["total_gross_cents"] or 0),
+                    "receipt_count": int(row["receipt_count"] or 0),
+                }
+                for row in cur.fetchall()
+            ]
+
+            return {"filters": filter_meta, "points": timeseries}
+
+    def fetch_merchant_spend(
+        self, *, date_from: Optional[str] = None, date_to: Optional[str] = None, limit: int = 10
+    ) -> Dict[str, Any]:
+        """Return top merchants by gross spend within an optional date range."""
+        where_sql, params, filter_meta = self._date_filters(date_from, date_to)
+        with self.connect() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"""
+                SELECT
+                    r.merchant_id,
+                    m.name AS merchant_name,
+                    SUM(COALESCE(r.total_gross, 0)) AS total_gross_cents,
+                    COUNT(*) AS receipt_count
+                FROM receipts r
+                JOIN merchants m ON m.merchant_id = r.merchant_id
+                {where_sql}
+                GROUP BY r.merchant_id, m.name
+                ORDER BY total_gross_cents DESC, m.name ASC
+                LIMIT ?;
+                """,
+                (*params, int(limit)),
+            )
+            items = [
+                {
+                    "merchant_id": row["merchant_id"],
+                    "merchant_name": row["merchant_name"],
+                    "total_gross_cents": int(row["total_gross_cents"] or 0),
+                    "receipt_count": int(row["receipt_count"] or 0),
+                }
+                for row in cur.fetchall()
+            ]
+
+        return {"filters": filter_meta, "items": items}
 
     def fetch_receipt_detail(self, receipt_id: int) -> Optional[Dict[str, Any]]:
         """Return detailed receipt information with related entities."""

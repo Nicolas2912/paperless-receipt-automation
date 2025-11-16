@@ -1,6 +1,5 @@
 import { useMemo, useState } from "react";
 import {
-  Box,
   Chip,
   Paper,
   Stack,

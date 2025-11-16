@@ -41,7 +41,6 @@ import {
   fetchReceiptDetail,
   fetchReceipts,
   MerchantOverviewItem,
-  ReceiptDetail,
   ReceiptOverviewItem
 } from "../api/client";
 import { formatCurrency, formatDateTime, formatPercent } from "../utils/format";
