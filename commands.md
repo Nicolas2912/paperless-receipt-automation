@@ -30,7 +30,19 @@ python -m paperless_automation productdb init
 
 # Running frontend
 
+1. 
+
 ```bash
 python -m paperless_automation productdb serve --host 127.0.0.1 --port 8001
 ```
+2. 
 
+```bash
+cd .\frontend\productdb-ui\
+```
+
+3. 
+
+```bash
+npm run dev
+```

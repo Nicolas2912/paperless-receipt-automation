@@ -78,7 +78,6 @@ CREATE TABLE receipt_items (
   receipt_id       INTEGER NOT NULL REFERENCES receipts(receipt_id) ON DELETE CASCADE,
   product_name     TEXT NOT NULL,
   quantity         REAL NOT NULL CHECK(quantity > 0),
-  unit             TEXT,               -- "x","kg","l"
   unit_price_net   INTEGER,            -- cents (nullable)
   unit_price_gross INTEGER,            -- cents (nullable)
   tax_rate         REAL NOT NULL CHECK(tax_rate IN (0.00, 0.07, 0.19)),

@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "lint": "eslint \"src/**/*.{ts,tsx}\""
   },
@@ -21,6 +21,7 @@
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@types/node": "^24.10.1",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.5",
     "@typescript-eslint/eslint-plugin": "^7.18.0",

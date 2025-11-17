@@ -1,61 +1,228 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
-  AppBar,
   Box,
-  Container,
-  Tab,
-  Tabs,
-  Toolbar,
+  Divider,
+  IconButton,
+  List,
+  ListItemButton,
+  ListItemIcon,
+  ListItemText,
+  Paper,
+  Stack,
   Typography
 } from "@mui/material";
 import SpaceDashboardIcon from "@mui/icons-material/SpaceDashboard";
 import ReceiptLongIcon from "@mui/icons-material/ReceiptLong";
 import StorefrontIcon from "@mui/icons-material/Storefront";
-import TableChartIcon from "@mui/icons-material/TableChart";
+import InsightsIcon from "@mui/icons-material/Insights";
+import InventoryIcon from "@mui/icons-material/Inventory";
+import VerifiedUserIcon from "@mui/icons-material/VerifiedUser";
+import SettingsIcon from "@mui/icons-material/Settings";
+import { useQuery } from "@tanstack/react-query";
+import GlobalFilterBar, { GlobalFilters } from "./components/GlobalFilterBar";
 import DashboardView from "./views/DashboardView";
 import ReceiptsView from "./views/ReceiptsView";
 import MerchantsView from "./views/MerchantsView";
-import TablesView from "./views/TablesView";
+import ProductsView from "./views/ProductsView";
+import InsightsView from "./views/InsightsView";
+import DataQualityView from "./views/DataQualityView";
+import AIChatView from "./views/AIChatView";
+import { fetchMerchants, fetchSummary } from "./api/client";
+import { formatCurrency } from "./utils/format";
 
-const tabs = [
-  { value: "dashboard", label: "Overview", icon: <SpaceDashboardIcon fontSize="small" /> },
-  { value: "receipts", label: "Receipts", icon: <ReceiptLongIcon fontSize="small" /> },
-  { value: "merchants", label: "Merchants", icon: <StorefrontIcon fontSize="small" /> },
-  { value: "tables", label: "Tables", icon: <TableChartIcon fontSize="small" /> }
+type PageKey = "dashboard" | "merchants" | "products" | "insights" | "receipts" | "data-quality" | "ai-chat";
+
+const navItems: Array<{ key: PageKey; label: string; icon: React.ReactNode; description: string }> = [
+  { key: "dashboard", label: "Dashboard", icon: <SpaceDashboardIcon fontSize="small" />, description: "At a glance" },
+  { key: "merchants", label: "Merchants", icon: <StorefrontIcon fontSize="small" />, description: "Master–detail" },
+  { key: "products", label: "Products", icon: <InventoryIcon fontSize="small" />, description: "Price tracking" },
+  { key: "insights", label: "Insights", icon: <InsightsIcon fontSize="small" />, description: "Behaviour" },
+  { key: "receipts", label: "Receipts", icon: <ReceiptLongIcon fontSize="small" />, description: "Drill-down" },
+  { key: "ai-chat", label: "AI Chat", icon: <InsightsIcon fontSize="small" />, description: "Ask about your data" },
+  { key: "data-quality", label: "Data Quality", icon: <VerifiedUserIcon fontSize="small" />, description: "Runs & QC" }
 ];
 
 const App = () => {
-  const [activeTab, setActiveTab] = useState<string>("dashboard");
+  const [activePage, setActivePage] = useState<PageKey>("dashboard");
+  const [filters, setFilters] = useState<GlobalFilters>({
+    timeRange: "this_month",
+    currency: "EUR",
+    merchantId: null,
+    search: ""
+  });
+
+  const merchantsQuery = useQuery({ queryKey: ["merchants"], queryFn: fetchMerchants });
+  const summaryQuery = useQuery({ queryKey: ["summary"], queryFn: () => fetchSummary() });
+
+  const quickStats = useMemo(() => {
+    const counts = summaryQuery.data?.counts ?? {};
+    const totals = summaryQuery.data?.totals;
+    return [
+      { label: "Receipts", value: counts.receipts ?? "—" },
+      { label: "Products", value: counts.receipt_items ?? "—" },
+      { label: "Merchants", value: counts.merchants ?? "—" },
+      {
+        label: "Total Gross",
+        value: totals ? formatCurrency(totals.total_gross_cents) : "—"
+      }
+    ];
+  }, [summaryQuery.data]);
+
+  const renderPage = () => {
+    switch (activePage) {
+      case "dashboard":
+        return <DashboardView filters={filters} />;
+      case "merchants":
+        return <MerchantsView filters={filters} />;
+      case "products":
+        return <ProductsView filters={filters} />;
+      case "insights":
+        return <InsightsView filters={filters} />;
+      case "receipts":
+        return <ReceiptsView filters={filters} />;
+      case "data-quality":
+        return <DataQualityView filters={filters} />;
+      case "ai-chat":
+        return <AIChatView filters={filters} />;
+      default:
+        return null;
+    }
+  };
 
   return (
-    <Box sx={{ minHeight: "100vh", background: "linear-gradient(180deg, #f5f7fa 0%, #eef2f7 100%)" }}>
-      <AppBar position="sticky" elevation={0} sx={{ backgroundColor: "#ffffff", color: "#0f172a", borderBottom: "1px solid #e2e8f0" }}>
-        <Toolbar sx={{ display: "flex", flexDirection: { xs: "column", sm: "row" }, alignItems: { xs: "flex-start", sm: "center" }, gap: 1 }}>
-          <Typography variant="h6" sx={{ fontWeight: 700 }}>
-            ProductDB Dashboard
+    <Box
+      sx={{
+        minHeight: "100vh",
+        backgroundColor: "#f4f4f5",
+        display: "flex",
+        gap: 3,
+        p: { xs: 2, md: 3 }
+      }}
+    >
+      <Paper
+        elevation={0}
+        sx={{
+          width: { xs: 280, md: 280 },
+          flexShrink: 0,
+          border: "1px solid #e4e4e7",
+          display: "flex",
+          flexDirection: "column",
+          gap: 2,
+          p: 2,
+          height: "fit-content",
+          position: "sticky",
+          top: 16
+        }}
+      >
+        <Stack spacing={0.5}>
+          <Typography variant="overline" color="text.secondary">
+            Analytics suite
           </Typography>
-          <Tabs
-            value={activeTab}
-            onChange={(_, value) => setActiveTab(value)}
-            textColor="inherit"
-            indicatorColor="secondary"
-            variant="scrollable"
-            scrollButtons="auto"
-            sx={{ ml: { sm: 4 }, mt: { xs: 1, sm: 0 } }}
-          >
-            {tabs.map((tab) => (
-              <Tab key={tab.value} value={tab.value} icon={tab.icon} iconPosition="start" label={tab.label} />
-            ))}
-          </Tabs>
-        </Toolbar>
-      </AppBar>
+          <Typography variant="h6" fontWeight={800}>
+            Receipt Analyzer
+          </Typography>
+        </Stack>
 
-      <Container maxWidth="xl" sx={{ py: 4 }}>
-        {activeTab === "dashboard" && <DashboardView />}
-        {activeTab === "receipts" && <ReceiptsView />}
-        {activeTab === "merchants" && <MerchantsView />}
-        {activeTab === "tables" && <TablesView />}
-      </Container>
+        <List dense>
+          {navItems.map((item) => (
+            <ListItemButton
+              key={item.key}
+              selected={item.key === activePage}
+              onClick={() => setActivePage(item.key)}
+              sx={{
+                borderRadius: 2,
+                mb: 0.5,
+                border: item.key === activePage ? "1px solid #dbeafe" : "1px solid transparent",
+                background: item.key === activePage ? "#dbeafe" : "#f4f4f5",
+                "&:hover": {
+                  background: "#e5edff"
+                }
+              }}
+            >
+              <ListItemIcon sx={{ minWidth: 36 }}>{item.icon}</ListItemIcon>
+              <ListItemText
+                primary={<Typography fontWeight={700}>{item.label}</Typography>}
+                secondary={<Typography variant="caption">{item.description}</Typography>}
+              />
+            </ListItemButton>
+          ))}
+        </List>
+
+        <Divider />
+
+        <Stack spacing={1.5}>
+          <Typography variant="subtitle2" color="text.secondary">
+            Quick stats
+          </Typography>
+          {quickStats.map((stat) => (
+            <Paper
+              key={stat.label}
+              elevation={0}
+              sx={{ p: 1.5, border: "1px dashed #e4e4e7", backgroundColor: "#ffffff" }}
+            >
+              <Typography variant="caption" color="text.secondary">
+                {stat.label}
+              </Typography>
+              <Typography variant="subtitle1" fontWeight={700}>
+                {stat.value}
+              </Typography>
+            </Paper>
+          ))}
+        </Stack>
+      </Paper>
+
+      <Box sx={{ flex: 1, display: "flex", flexDirection: "column", gap: 2 }}>
+        <Paper
+          elevation={0}
+          sx={{
+            border: "1px solid #e4e4e7",
+            p: { xs: 2, md: 2.5 },
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 2
+          }}
+        >
+          <Box>
+            <Typography variant="h5" fontWeight={800}>
+              Receipt Analyzer
+            </Typography>
+          </Box>
+          <IconButton aria-label="settings">
+            <SettingsIcon />
+          </IconButton>
+        </Paper>
+
+        <GlobalFilterBar
+          filters={filters}
+          onChange={(updates) => setFilters((prev) => ({ ...prev, ...updates }))}
+          merchants={merchantsQuery.data?.items ?? []}
+          merchantsLoading={merchantsQuery.isLoading}
+        />
+
+        {renderPage()}
+
+        <Paper
+          elevation={0}
+          sx={{
+            mt: 1,
+            border: "1px solid #e2e8f0",
+            p: 1.5,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            background: "#ffffff"
+          }}
+        >
+          <Typography variant="body2" color="text.secondary">
+            Status: {summaryQuery.data?.counts?.receipts ?? "—"} receipts • Last sync:{" "}
+            {summaryQuery.data?.timespan?.last_purchase ?? "—"}
+          </Typography>
+          <Typography variant="caption" color="text.secondary">
+            Filters apply to all views
+          </Typography>
+        </Paper>
+      </Box>
     </Box>
   );
 };

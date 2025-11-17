@@ -2,12 +2,7 @@ import { useMemo, useState } from "react";
 import {
   Autocomplete,
   Box,
-  Chip,
-  Dialog,
-  DialogActions,
-  DialogContent,
-  DialogTitle,
-  Divider,
+  Drawer,
   Grid,
   IconButton,
   InputAdornment,
@@ -22,20 +17,15 @@ import {
   TableRow,
   TableSortLabel,
   TextField,
-  Toolbar,
   Tooltip,
-  Typography,
-  Button,
-  CircularProgress,
-  Accordion,
-  AccordionSummary,
-  AccordionDetails
+  Typography
 } from "@mui/material";
-import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import SearchIcon from "@mui/icons-material/Search";
 import ClearIcon from "@mui/icons-material/Clear";
 import RestartAltIcon from "@mui/icons-material/RestartAlt";
 import { useQuery } from "@tanstack/react-query";
+import PlaceholderCard from "../components/PlaceholderCard";
+import { GlobalFilters } from "../components/GlobalFilterBar";
 import {
   fetchMerchants,
   fetchReceiptDetail,
@@ -45,19 +35,23 @@ import {
 } from "../api/client";
 import { formatCurrency, formatDateTime, formatPercent } from "../utils/format";
 
+interface ReceiptsViewProps {
+  filters: GlobalFilters;
+}
+
 interface SortState {
   sort: "purchase_date_time" | "total_gross" | "merchant" | "item_count";
   direction: "asc" | "desc";
 }
 
-const ReceiptsView = () => {
+const ReceiptsView = ({ filters }: ReceiptsViewProps) => {
   const [page, setPage] = useState(0);
-  const [rowsPerPage, setRowsPerPage] = useState(25);
-  const [searchTerm, setSearchTerm] = useState("");
+  const [rowsPerPage, setRowsPerPage] = useState(15);
+  const [searchTerm, setSearchTerm] = useState(filters.search ?? "");
   const [selectedMerchant, setSelectedMerchant] = useState<MerchantOverviewItem | null>(null);
   const [sortState, setSortState] = useState<SortState>({ sort: "purchase_date_time", direction: "desc" });
-  const [detailOpen, setDetailOpen] = useState(false);
   const [selectedReceipt, setSelectedReceipt] = useState<ReceiptOverviewItem | null>(null);
+  const [drawerOpen, setDrawerOpen] = useState(false);
 
   const merchantsQuery = useQuery({ queryKey: ["merchants"], queryFn: fetchMerchants });
 
@@ -67,7 +61,7 @@ const ReceiptsView = () => {
       {
         page,
         limit: rowsPerPage,
-        search: searchTerm.trim() || undefined,
+        search: searchTerm.trim() || filters.search || undefined,
         merchantId: selectedMerchant?.merchant_id,
         sort: sortState.sort,
         direction: sortState.direction
@@ -77,7 +71,7 @@ const ReceiptsView = () => {
       fetchReceipts({
         page,
         limit: rowsPerPage,
-        search: searchTerm.trim() || undefined,
+        search: searchTerm.trim() || filters.search || undefined,
         merchantId: selectedMerchant?.merchant_id,
         sort: sortState.sort,
         direction: sortState.direction
@@ -86,7 +80,7 @@ const ReceiptsView = () => {
 
   const detailQuery = useQuery({
     queryKey: ["receipt-detail", selectedReceipt?.receipt_id],
-    enabled: detailOpen && Boolean(selectedReceipt?.receipt_id),
+    enabled: drawerOpen && Boolean(selectedReceipt?.receipt_id),
     queryFn: () => fetchReceiptDetail(selectedReceipt!.receipt_id)
   });
 
@@ -106,17 +100,66 @@ const ReceiptsView = () => {
 
   const handleRowClick = (row: ReceiptOverviewItem) => {
     setSelectedReceipt(row);
-    setDetailOpen(true);
+    setDrawerOpen(true);
   };
 
-  const closeDetail = () => {
-    setDetailOpen(false);
-  };
+  const detailPanel = selectedReceipt ? (
+    <Stack spacing={2} sx={{ p: 1 }}>
+      <Paper variant="outlined" sx={{ p: 2 }}>
+        <Typography variant="subtitle2" color="text.secondary">
+          {formatDateTime(selectedReceipt.purchase_date_time)}
+        </Typography>
+        <Typography variant="h6" fontWeight={800}>
+          {selectedReceipt.merchant_name}
+        </Typography>
+        <Typography variant="body2" color="text.secondary">
+          {selectedReceipt.merchant_city ?? "Unknown city"}
+        </Typography>
+        <Typography variant="subtitle1" fontWeight={800} sx={{ mt: 1 }}>
+          {formatCurrency((selectedReceipt.total_gross ?? 0) * 100)}
+        </Typography>
+        <Typography variant="body2" color="text.secondary">
+          Payment: {selectedReceipt.payment_method || "Unknown"} • Items: {selectedReceipt.item_count}
+        </Typography>
+      </Paper>
+      <PlaceholderCard
+        title="ReceiptSummary"
+        subtitle="Header info for the receipt"
+        height={120}
+      />
+      <PlaceholderCard
+        title="ReceiptItemsChart"
+        subtitle="Donut or bars by line_gross share"
+        height={160}
+      />
+      <PlaceholderCard
+        title="RawReceiptPreview"
+        subtitle="Image or text preview of the receipt"
+        height={160}
+      />
+    </Stack>
+  ) : (
+    <Paper variant="outlined" sx={{ p: 2, height: "100%" }}>
+      <Typography color="text.secondary">Select a receipt to see details.</Typography>
+    </Paper>
+  );
 
   return (
-    <Stack spacing={3}>
-      <Paper elevation={0} sx={{ p: 2.5 }}>
-        <Toolbar disableGutters sx={{ gap: 2, flexWrap: "wrap" }}>
+    <Stack spacing={2}>
+      <Paper elevation={0} sx={{ p: 2.5, border: "1px solid #e2e8f0" }}>
+        <Typography variant="h6" fontWeight={800} sx={{ mb: 0.5 }}>
+          Receipts drill-down
+        </Typography>
+        <Typography variant="body2" color="text.secondary">
+          Left: receipts table. Right: detail with summary, items chart, and raw preview. Drawer opens on row click.
+        </Typography>
+        <Typography variant="caption" color="text.secondary">
+          Filters: {filters.timeRange} • {filters.currency}
+        </Typography>
+      </Paper>
+
+      <Paper elevation={0} sx={{ p: 2.5, border: "1px solid #e2e8f0" }}>
+        <Stack direction={{ xs: "column", md: "row" }} spacing={2}>
           <TextField
             placeholder="Search receipts (merchant, date, currency, payment method)"
             value={searchTerm}
@@ -125,7 +168,7 @@ const ReceiptsView = () => {
               setSearchTerm(event.target.value);
             }}
             size="small"
-            sx={{ width: { xs: "100%", md: 340 } }}
+            sx={{ width: { xs: "100%", md: 320 } }}
             InputProps={{
               startAdornment: (
                 <InputAdornment position="start">
@@ -134,7 +177,7 @@ const ReceiptsView = () => {
               ),
               endAdornment: searchTerm ? (
                 <InputAdornment position="end">
-                  <IconButton size="small" onClick={() => setSearchTerm("")}> 
+                  <IconButton size="small" onClick={() => setSearchTerm("")}>
                     <ClearIcon fontSize="small" />
                   </IconButton>
                 </InputAdornment>
@@ -167,269 +210,129 @@ const ReceiptsView = () => {
               <RestartAltIcon />
             </IconButton>
           </Tooltip>
-        </Toolbar>
+        </Stack>
       </Paper>
 
-      <Paper elevation={0}>
-        <TableContainer>
-          <Table size="small">
-            <TableHead>
-              <TableRow>
-                <TableCell sortDirection={sortState.sort === "purchase_date_time" ? sortState.direction : false}>
-                  <TableSortLabel
-                    active={sortState.sort === "purchase_date_time"}
-                    direction={sortState.sort === "purchase_date_time" ? sortState.direction : "asc"}
-                    onClick={() => handleSort("purchase_date_time")}
-                  >
-                    Purchase Date
-                  </TableSortLabel>
-                </TableCell>
-                <TableCell>Merchant</TableCell>
-                <TableCell>Payment</TableCell>
-                <TableCell sortDirection={sortState.sort === "total_gross" ? sortState.direction : false}>
-                  <TableSortLabel
-                    active={sortState.sort === "total_gross"}
-                    direction={sortState.sort === "total_gross" ? sortState.direction : "asc"}
-                    onClick={() => handleSort("total_gross")}
-                  >
-                    Total Gross
-                  </TableSortLabel>
-                </TableCell>
-                <TableCell sortDirection={sortState.sort === "item_count" ? sortState.direction : false}>
-                  <TableSortLabel
-                    active={sortState.sort === "item_count"}
-                    direction={sortState.sort === "item_count" ? sortState.direction : "asc"}
-                    onClick={() => handleSort("item_count")}
-                  >
-                    Items
-                  </TableSortLabel>
-                </TableCell>
-                <TableCell sortDirection={sortState.sort === "merchant" ? sortState.direction : false}>
-                  <TableSortLabel
-                    active={sortState.sort === "merchant"}
-                    direction={sortState.sort === "merchant" ? sortState.direction : "asc"}
-                    onClick={() => handleSort("merchant")}
-                  >
-                    Location
-                  </TableSortLabel>
-                </TableCell>
-              </TableRow>
-            </TableHead>
-            <TableBody>
-              {receiptsQuery.isLoading && (
-                <TableRow>
-                  <TableCell colSpan={6} align="center" sx={{ py: 6 }}>
-                    <CircularProgress size={28} />
-                  </TableCell>
-                </TableRow>
-              )}
+      <Grid container spacing={2} alignItems="stretch">
+        <Grid item xs={12} md={7}>
+          <Paper elevation={0} sx={{ border: "1px solid #e2e8f0" }}>
+            <TableContainer>
+              <Table size="small">
+                <TableHead>
+                  <TableRow>
+                    <TableCell sortDirection={sortState.sort === "purchase_date_time" ? sortState.direction : false}>
+                      <TableSortLabel
+                        active={sortState.sort === "purchase_date_time"}
+                        direction={sortState.sort === "purchase_date_time" ? sortState.direction : "asc"}
+                        onClick={() => handleSort("purchase_date_time")}
+                      >
+                        Purchase Date
+                      </TableSortLabel>
+                    </TableCell>
+                    <TableCell>Merchant</TableCell>
+                    <TableCell>Payment</TableCell>
+                    <TableCell sortDirection={sortState.sort === "total_gross" ? sortState.direction : false}>
+                      <TableSortLabel
+                        active={sortState.sort === "total_gross"}
+                        direction={sortState.sort === "total_gross" ? sortState.direction : "asc"}
+                        onClick={() => handleSort("total_gross")}
+                      >
+                        Total Gross
+                      </TableSortLabel>
+                    </TableCell>
+                    <TableCell sortDirection={sortState.sort === "item_count" ? sortState.direction : false}>
+                      <TableSortLabel
+                        active={sortState.sort === "item_count"}
+                        direction={sortState.sort === "item_count" ? sortState.direction : "asc"}
+                        onClick={() => handleSort("item_count")}
+                      >
+                        Items
+                      </TableSortLabel>
+                    </TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {(receiptsQuery.data?.items ?? []).map((row) => (
+                    <TableRow
+                      key={row.receipt_id}
+                      hover
+                      selected={row.receipt_id === selectedReceipt?.receipt_id}
+                      onClick={() => handleRowClick(row)}
+                      sx={{ cursor: "pointer" }}
+                    >
+                      <TableCell>{formatDateTime(row.purchase_date_time)}</TableCell>
+                      <TableCell>
+                        <Typography fontWeight={700}>{row.merchant_name}</Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {row.merchant_city ?? "Unknown city"}
+                        </Typography>
+                      </TableCell>
+                      <TableCell>
+                        <Typography variant="body2">{row.payment_method || "Unknown"}</Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          Currency: {row.currency}
+                        </Typography>
+                      </TableCell>
+                      <TableCell>{formatCurrency((row.total_gross ?? 0) * 100)}</TableCell>
+                      <TableCell>{row.item_count}</TableCell>
+                    </TableRow>
+                  ))}
+                  {(receiptsQuery.data?.items ?? []).length === 0 && (
+                    <TableRow>
+                      <TableCell colSpan={5} align="center" sx={{ py: 4 }}>
+                        <Typography color="text.secondary">No receipts found.</Typography>
+                      </TableCell>
+                    </TableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </TableContainer>
+            <TablePagination
+              component="div"
+              count={receiptsQuery.data?.total ?? 0}
+              page={page}
+              onPageChange={(_, newPage) => setPage(newPage)}
+              rowsPerPage={rowsPerPage}
+              onRowsPerPageChange={(event) => {
+                setRowsPerPage(parseInt(event.target.value, 10));
+                setPage(0);
+              }}
+              rowsPerPageOptions={[10, 15, 25, 50]}
+            />
+          </Paper>
+        </Grid>
 
-              {receiptsQuery.isError && (
-                <TableRow>
-                  <TableCell colSpan={6} align="center" sx={{ py: 6 }}>
-                    <Typography color="error">Failed to load receipts.</Typography>
-                  </TableCell>
-                </TableRow>
-              )}
+        <Grid item xs={12} md={5}>
+          {detailPanel}
+        </Grid>
+      </Grid>
 
-              {receiptsQuery.data?.items.length === 0 && !receiptsQuery.isLoading && (
-                <TableRow>
-                  <TableCell colSpan={6} align="center" sx={{ py: 6 }}>
-                    <Typography color="text.secondary">No receipts found.</Typography>
-                  </TableCell>
-                </TableRow>
-              )}
-
-              {receiptsQuery.data?.items.map((row) => (
-                <TableRow
-                  key={row.receipt_id}
-                  hover
-                  sx={{ cursor: "pointer" }}
-                  onClick={() => handleRowClick(row)}
-                >
-                  <TableCell>{formatDateTime(row.purchase_date_time)}</TableCell>
-                  <TableCell>
-                    <Stack spacing={0.5}>
-                      <Typography fontWeight={600}>{row.merchant_name}</Typography>
-                      <Typography variant="body2" color="text.secondary">
-                        {row.merchant_city ?? "Unknown city"} · {row.merchant_country ?? "Unknown country"}
-                      </Typography>
-                    </Stack>
-                  </TableCell>
-                  <TableCell>
-                    <Chip size="small" label={row.payment_method} />
-                  </TableCell>
-                  <TableCell>{formatCurrency(row.total_gross, row.currency)}</TableCell>
-                  <TableCell>{row.item_count}</TableCell>
-                  <TableCell>
-                    <Typography variant="body2" color="text.secondary">
-                      {row.merchant_city ?? "–"}
-                    </Typography>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </TableContainer>
-        <TablePagination
-          component="div"
-          count={receiptsQuery.data?.total ?? 0}
-          page={page}
-          onPageChange={(_, newPage) => setPage(newPage)}
-          rowsPerPage={rowsPerPage}
-          onRowsPerPageChange={(event) => {
-            setRowsPerPage(parseInt(event.target.value, 10));
-            setPage(0);
-          }}
-          rowsPerPageOptions={[10, 25, 50, 100]}
-        />
-      </Paper>
-
-      <Dialog
-        open={detailOpen}
-        onClose={closeDetail}
-        fullWidth
-        maxWidth="md"
-        scroll="paper"
-      >
-        <DialogTitle>Receipt details</DialogTitle>
-        <DialogContent dividers>
-          {detailQuery.isLoading && (
-            <Box sx={{ display: "flex", justifyContent: "center", py: 4 }}>
-              <CircularProgress />
-            </Box>
-          )}
-
-          {detailQuery.isError && (
-            <Typography color="error">Failed to load receipt.</Typography>
-          )}
-
-          {detailQuery.data && (
-            <Stack spacing={3}>
-              <Box>
-                <Typography variant="h6">{detailQuery.data.merchant_name}</Typography>
-                <Typography variant="body2" color="text.secondary">
-                  {detailQuery.data.street ?? ""} {detailQuery.data.city ?? ""} {detailQuery.data.country ?? ""}
+      <Drawer anchor="right" open={drawerOpen} onClose={() => setDrawerOpen(false)}>
+        <Box sx={{ width: 360, p: 2 }}>
+          {drawerOpen && detailQuery.data ? (
+            <Stack spacing={1}>
+              {detailPanel}
+              <Paper variant="outlined" sx={{ p: 2 }}>
+                <Typography variant="subtitle2" color="text.secondary">
+                  Items preview
                 </Typography>
-              </Box>
-
-              <Grid container spacing={2}>
-                <Grid item xs={12} sm={6}>
-                  <Paper variant="outlined" sx={{ p: 2 }}>
-                    <Typography variant="subtitle2" color="text.secondary">
-                      Purchase date
-                    </Typography>
-                    <Typography fontWeight={600}>
-                      {formatDateTime(detailQuery.data.purchase_date_time)}
-                    </Typography>
-                    <Divider sx={{ my: 1 }} />
-                    <Typography variant="subtitle2" color="text.secondary">
-                      Payment method
-                    </Typography>
-                    <Chip label={detailQuery.data.payment_method} />
-                  </Paper>
-                </Grid>
-                <Grid item xs={12} sm={6}>
-                  <Paper variant="outlined" sx={{ p: 2 }}>
-                    <Typography variant="subtitle2" color="text.secondary">
-                      Totals
-                    </Typography>
-                    <Typography fontWeight={600}>
-                      Gross: {formatCurrency(detailQuery.data.total_gross, detailQuery.data.currency)}
-                    </Typography>
-                    <Typography variant="body2" color="text.secondary">
-                      Net: {formatCurrency(detailQuery.data.total_net, detailQuery.data.currency)}
-                    </Typography>
-                    <Typography variant="body2" color="text.secondary">
-                      Tax: {formatCurrency(detailQuery.data.total_tax, detailQuery.data.currency)}
-                    </Typography>
-                  </Paper>
-                </Grid>
-              </Grid>
-
-              <Paper variant="outlined">
-                <TableContainer>
-                  <Table size="small">
-                    <TableHead>
-                      <TableRow>
-                        <TableCell>Product</TableCell>
-                        <TableCell>Type</TableCell>
-                        <TableCell align="right">Quantity</TableCell>
-                        <TableCell align="right">Unit Net</TableCell>
-                        <TableCell align="right">Unit Gross</TableCell>
-                        <TableCell align="right">Tax</TableCell>
-                        <TableCell align="right">Line Gross</TableCell>
-                      </TableRow>
-                    </TableHead>
-                    <TableBody>
-                      {detailQuery.data.items.map((item) => (
-                        <TableRow key={item.item_id}>
-                          <TableCell>
-                            <Stack spacing={0.5}>
-                              <Typography fontWeight={600}>{item.product_name}</Typography>
-                            </Stack>
-                          </TableCell>
-                          <TableCell>
-                            <Chip size="small" label={item.line_type} variant="outlined" />
-                          </TableCell>
-                          <TableCell align="right">{item.quantity}</TableCell>
-                          <TableCell align="right">
-                            {formatCurrency(item.unit_price_net, detailQuery.data.currency)}
-                          </TableCell>
-                          <TableCell align="right">
-                            {formatCurrency(item.unit_price_gross, detailQuery.data.currency)}
-                          </TableCell>
-                          <TableCell align="right">{formatPercent(item.tax_rate)}</TableCell>
-                          <TableCell align="right">
-                            {formatCurrency(item.line_gross, detailQuery.data.currency)}
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </TableContainer>
-              </Paper>
-
-              {detailQuery.data.extraction_runs.length > 0 && (
-                <Paper variant="outlined" sx={{ p: 2 }}>
-                  <Typography variant="subtitle2" color="text.secondary" gutterBottom>
-                    Extraction Runs
+                {detailQuery.data.items.slice(0, 5).map((item) => (
+                  <Typography key={item.item_id} variant="body2">
+                    {item.product_name} • {formatCurrency((item.line_gross ?? 0) * 100)} • Tax {formatPercent(item.tax_rate / 100)}
                   </Typography>
-                  <Stack spacing={1.5}>
-                    {detailQuery.data.extraction_runs.map((run) => (
-                      <Stack key={run.run_id} direction="row" justifyContent="space-between" alignItems="center">
-                        <Box>
-                          <Typography fontWeight={600}>{run.model_name}</Typography>
-                          <Typography variant="body2" color="text.secondary">
-                            Started {formatDateTime(run.started_at)} · Finished {formatDateTime(run.finished_at)}
-                          </Typography>
-                        </Box>
-                        <Chip label={run.status ?? "OK"} color="success" variant="outlined" />
-                      </Stack>
-                    ))}
-                  </Stack>
-                </Paper>
-              )}
-
-              {detailQuery.data.raw_content && (
-                <Accordion>
-                  <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-                    <Typography>Raw Payload</Typography>
-                  </AccordionSummary>
-                  <AccordionDetails>
-                    <Box component="pre" sx={{ whiteSpace: "pre-wrap", fontSize: 12 }}>
-                      {detailQuery.data.raw_content}
-                    </Box>
-                  </AccordionDetails>
-                </Accordion>
-              )}
+                ))}
+                {detailQuery.data.items.length === 0 && (
+                  <Typography variant="body2" color="text.secondary">
+                    No items recorded.
+                  </Typography>
+                )}
+              </Paper>
             </Stack>
+          ) : (
+            detailPanel
           )}
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={closeDetail}>Close</Button>
-        </DialogActions>
-      </Dialog>
+        </Box>
+      </Drawer>
     </Stack>
   );
 };

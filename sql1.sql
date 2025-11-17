@@ -1,10 +1,44 @@
-SELECT * from receipt_items WHERE receipt_id = 1
-SELECT SUM(line_gross) from receipt_items WHERE receipt_id = 2
+SELECT * from receipt_items WHERE receipt_id = 9
+SELECT SUM(line_gross) from receipt_items WHERE receipt_id = 1
 SELECT * from correct_data
 
 SELECT SUM(line_gross) from receipt_items GROUP BY receipt_id
 
 SELECT * from receipt
+
+SELECT
+  merchant_id,
+  name,
+  length(name)               AS len_chars,
+  hex(name)                  AS hex_bytes
+FROM merchants
+WHERE merchant_id IN (1, 9);
+
+WITH RECURSIVE
+  limits AS (
+    SELECT max(length(name)) AS maxlen
+    FROM merchants
+    WHERE merchant_id IN (1, 9)
+  ),
+  idx(i) AS (
+    SELECT 1
+    FROM limits
+    UNION ALL
+    SELECT i + 1
+    FROM idx, limits
+    WHERE i < limits.maxlen
+  )
+SELECT
+  substr(m1.name, i, 1)                  AS c1,
+  hex(substr(m1.name, i, 1))             AS c1_hex,
+  substr(m9.name, i, 1)                  AS c9,
+  hex(substr(m9.name, i, 1))             AS c9_hex,
+  i
+FROM idx
+JOIN merchants m1 ON m1.merchant_id = 1
+JOIN merchants m9 ON m9.merchant_id = 9
+WHERE c1 != c9 OR c1_hex != c9_hex;
+
 
 DELETE from correct_data
 -- create correct data TABLE
