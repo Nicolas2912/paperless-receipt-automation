@@ -166,6 +166,20 @@ export interface SpendTimeseriesResponse {
   points: SpendTimeseriesPoint[];
 }
 
+export interface MonthlySpendPoint {
+  month: string;
+  total_gross_cents: number;
+  receipt_count: number;
+}
+
+export interface MonthlySpendResponse {
+  filters: {
+    date_from: string | null;
+    date_to: string | null;
+  };
+  points: MonthlySpendPoint[];
+}
+
 export interface MerchantSpendItem {
   merchant_id: number;
   merchant_name: string;
@@ -204,6 +218,20 @@ export const fetchSpendTimeseries = async (
     params.set("to", filters.dateTo);
   }
   const { data } = await api.get<SpendTimeseriesResponse>("/timeseries/spend", { params });
+  return data;
+};
+
+export const fetchMonthlySpend = async (
+  filters: SummaryFilters = {}
+): Promise<MonthlySpendResponse> => {
+  const params = new URLSearchParams();
+  if (filters.dateFrom) {
+    params.set("from", filters.dateFrom);
+  }
+  if (filters.dateTo) {
+    params.set("to", filters.dateTo);
+  }
+  const { data } = await api.get<MonthlySpendResponse>("/analytics/monthly_spend", { params });
   return data;
 };
 

@@ -48,7 +48,7 @@ const MerchantsView = ({ filters }: MerchantsViewProps) => {
   };
 
   const merchantSummary = (
-    <Paper elevation={0} sx={{ p: 2.5, border: "1px solid #e2e8f0", mb: 2 }}>
+    <Paper elevation={0} sx={{ p: 2.5, border: "1px solid #E3D4C1", mb: 2 }}>
       <Typography variant="h6" fontWeight={800} sx={{ mb: 0.5 }}>
         Merchants master–detail
       </Typography>
@@ -104,7 +104,7 @@ const MerchantsView = ({ filters }: MerchantsViewProps) => {
       {merchantSummary}
       <Grid container spacing={2} alignItems="stretch">
         <Grid item xs={12} md={6} lg={5}>
-          <Paper elevation={0} sx={{ p: 2.5, height: "100%", border: "1px solid #e2e8f0" }}>
+          <Paper elevation={0} sx={{ p: 2.5, height: "100%", border: "1px solid #E3D4C1" }}>
             <TextField
               value={searchTerm}
               onChange={(event) => setSearchTerm(event.target.value)}

@@ -135,6 +135,16 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return JSONResponse(payload)
 
+    async def monthly_spend(request: Request) -> JSONResponse:
+        qp = request.query_params
+        date_from = qp.get("from") or qp.get("date_from")
+        date_to = qp.get("to") or qp.get("date_to")
+        try:
+            payload = db.fetch_monthly_spend(date_from=date_from, date_to=date_to)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(payload)
+
     async def table_rows(request: Request) -> JSONResponse:
         table = request.path_params["table"]
         qp = request.query_params
@@ -154,6 +164,7 @@ def create_app(
         Route("/api/merchants", merchants, methods=["GET"]),
         Route("/api/timeseries/spend", spend_timeseries, methods=["GET"]),
         Route("/api/analytics/merchant_spend", merchant_spend, methods=["GET"]),
+        Route("/api/analytics/monthly_spend", monthly_spend, methods=["GET"]),
         Route("/api/tables/{table:str}", table_rows, methods=["GET"]),
     ]
 

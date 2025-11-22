@@ -42,6 +42,15 @@ const navItems: Array<{ key: PageKey; label: string; icon: React.ReactNode; desc
   { key: "data-quality", label: "Data Quality", icon: <VerifiedUserIcon fontSize="small" />, description: "Runs & QC" }
 ];
 
+const UI_COLORS = {
+  background: "#FCEADE",
+  surface: "#FFF8EE",
+  border: "#E3D4C1",
+  subtle: "#F6E6D4",
+  accentSoft: "#FDC4BE",
+  accentHover: "#F6E6D4"
+};
+
 const App = () => {
   const [activePage, setActivePage] = useState<PageKey>("dashboard");
   const [filters, setFilters] = useState<GlobalFilters>({
@@ -93,7 +102,7 @@ const App = () => {
     <Box
       sx={{
         minHeight: "100vh",
-        backgroundColor: "#f4f4f5",
+        backgroundColor: UI_COLORS.background,
         display: "flex",
         gap: 3,
         p: { xs: 2, md: 3 }
@@ -104,7 +113,7 @@ const App = () => {
         sx={{
           width: { xs: 280, md: 280 },
           flexShrink: 0,
-          border: "1px solid #e4e4e7",
+          border: `1px solid ${UI_COLORS.border}`,
           display: "flex",
           flexDirection: "column",
           gap: 2,
@@ -132,14 +141,33 @@ const App = () => {
               sx={{
                 borderRadius: 2,
                 mb: 0.5,
-                border: item.key === activePage ? "1px solid #dbeafe" : "1px solid transparent",
-                background: item.key === activePage ? "#dbeafe" : "#f4f4f5",
+                border: item.key === activePage ? `1px solid #BC6C25` : `1px solid ${UI_COLORS.border}`,
+                background:
+                  item.key === activePage
+                    ? "linear-gradient(90deg, #FFF8EE 0%, #F6E6D4 100%)"
+                    : UI_COLORS.surface,
                 "&:hover": {
-                  background: "#e5edff"
-                }
+                  background: "linear-gradient(90deg, #FFF8EE 0%, #F6E6D4 100%)"
+                },
+                boxShadow: item.key === activePage ? "inset 4px 0 0 #BC6C25, 0 6px 18px rgba(40,54,24,0.12)" : "none"
               }}
             >
-              <ListItemIcon sx={{ minWidth: 36 }}>{item.icon}</ListItemIcon>
+              <ListItemIcon sx={{ minWidth: 40 }}>
+                <Box
+                  sx={{
+                    width: 30,
+                    height: 30,
+                    borderRadius: 2,
+                    display: "grid",
+                    placeItems: "center",
+                    backgroundColor: item.key === activePage ? UI_COLORS.accentSoft : UI_COLORS.surface,
+                    border: `1px solid ${UI_COLORS.border}`,
+                    boxShadow: item.key === activePage ? "0 0 0 1px #BC6C25 inset" : "none"
+                  }}
+                >
+                  {item.icon}
+                </Box>
+              </ListItemIcon>
               <ListItemText
                 primary={<Typography fontWeight={700}>{item.label}</Typography>}
                 secondary={<Typography variant="caption">{item.description}</Typography>}
@@ -158,7 +186,7 @@ const App = () => {
             <Paper
               key={stat.label}
               elevation={0}
-              sx={{ p: 1.5, border: "1px dashed #e4e4e7", backgroundColor: "#ffffff" }}
+              sx={{ p: 1.5, border: `1px dashed ${UI_COLORS.border}`, backgroundColor: UI_COLORS.surface }}
             >
               <Typography variant="caption" color="text.secondary">
                 {stat.label}
@@ -175,7 +203,7 @@ const App = () => {
         <Paper
           elevation={0}
           sx={{
-            border: "1px solid #e4e4e7",
+            border: `1px solid ${UI_COLORS.border}`,
             p: { xs: 2, md: 2.5 },
             display: "flex",
             alignItems: "center",
@@ -206,12 +234,12 @@ const App = () => {
           elevation={0}
           sx={{
             mt: 1,
-            border: "1px solid #e2e8f0",
+            border: `1px solid ${UI_COLORS.border}`,
             p: 1.5,
             display: "flex",
             alignItems: "center",
             justifyContent: "space-between",
-            background: "#ffffff"
+            background: UI_COLORS.surface
           }}
         >
           <Typography variant="body2" color="text.secondary">

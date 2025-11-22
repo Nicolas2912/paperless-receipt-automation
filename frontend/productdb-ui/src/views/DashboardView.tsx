@@ -4,6 +4,7 @@ import PlaceholderCard from "../components/PlaceholderCard";
 import { GlobalFilters } from "../components/GlobalFilterBar";
 import { fetchSummary } from "../api/client";
 import { formatCurrency } from "../utils/format";
+import MonthlySpendLineChart from "../components/MonthlySpendLineChart";
 
 interface DashboardViewProps {
   filters: GlobalFilters;
@@ -19,7 +20,7 @@ const DashboardView = ({ filters }: DashboardViewProps) => {
 
   return (
     <Stack spacing={2}>
-      <Paper elevation={0} sx={{ p: 2.5, border: "1px solid #e2e8f0" }}>
+      <Paper elevation={0} sx={{ p: 2.5, border: "1px solid #E3D4C1" }}>
         <Stack direction={{ xs: "column", md: "row" }} justifyContent="space-between" spacing={2}>
           <Stack spacing={0.5}>
             <Typography variant="h6" fontWeight={800}>
@@ -55,11 +56,7 @@ const DashboardView = ({ filters }: DashboardViewProps) => {
 
       <Grid container spacing={2}>
         <Grid item xs={12} lg={7}>
-          <PlaceholderCard
-            title="MonthlySpendLineChart"
-            subtitle="Sum of total_gross per month — primary chart anchors the dashboard layout."
-            height={300}
-          />
+          <MonthlySpendLineChart filters={filters} />
         </Grid>
         <Grid item xs={12} lg={5}>
           <Grid container spacing={2}>

@@ -63,7 +63,7 @@ const AIChatView = ({ filters }: AIChatViewProps) => {
 
   return (
     <Stack spacing={2}>
-      <Paper elevation={0} sx={{ p: 2.5, border: "1px solid #e4e4e7" }}>
+      <Paper elevation={0} sx={{ p: 2.5, border: "1px solid #E3D4C1" }}>
         <Typography variant="h6" fontWeight={800} sx={{ mb: 0.5 }}>
           AI / LLM chat
         </Typography>
@@ -79,7 +79,7 @@ const AIChatView = ({ filters }: AIChatViewProps) => {
       <Paper
         elevation={0}
         sx={{
-          border: "1px solid #e4e4e7",
+          border: "1px solid #E3D4C1",
           display: "flex",
           flexDirection: "column",
           minHeight: 460
@@ -97,8 +97,8 @@ const AIChatView = ({ filters }: AIChatViewProps) => {
             <Stack key={msg.id} direction="row" spacing={1.5} alignItems="flex-start">
               <Avatar
                 sx={{
-                  bgcolor: msg.role === "assistant" ? "#2563eb" : "#f59e0b",
-                  color: "#ffffff",
+                  bgcolor: msg.role === "assistant" ? "#283618" : "#BC6C25",
+                  color: "#FFF8EE",
                   width: 32,
                   height: 32
                 }}
@@ -109,8 +109,8 @@ const AIChatView = ({ filters }: AIChatViewProps) => {
                 variant="outlined"
                 sx={{
                   p: 1.5,
-                  backgroundColor: msg.role === "assistant" ? "#f8fafc" : "#ffffff",
-                  borderColor: "#e4e4e7",
+                  backgroundColor: msg.role === "assistant" ? "#F6E6D4" : "#FFF8EE",
+                  borderColor: "#E3D4C1",
                   maxWidth: "80%"
                 }}
               >

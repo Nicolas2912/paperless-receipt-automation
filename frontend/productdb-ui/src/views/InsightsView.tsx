@@ -9,7 +9,7 @@ interface InsightsViewProps {
 const InsightsView = ({ filters }: InsightsViewProps) => {
   return (
     <Stack spacing={2}>
-      <Paper elevation={0} sx={{ p: 2.5, border: "1px solid #e2e8f0" }}>
+      <Paper elevation={0} sx={{ p: 2.5, border: "1px solid #E3D4C1" }}>
         <Typography variant="h6" fontWeight={800} sx={{ mb: 0.5 }}>
           Insights
         </Typography>

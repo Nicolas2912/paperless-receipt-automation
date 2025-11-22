@@ -87,7 +87,7 @@ const ProductsView = ({ filters }: ProductsViewProps) => {
 
   return (
     <Stack spacing={2}>
-      <Paper elevation={0} sx={{ p: 2.5, border: "1px solid #e2e8f0" }}>
+      <Paper elevation={0} sx={{ p: 2.5, border: "1px solid #E3D4C1" }}>
         <Typography variant="h6" fontWeight={800} sx={{ mb: 0.5 }}>
           Products page
         </Typography>
@@ -101,7 +101,7 @@ const ProductsView = ({ filters }: ProductsViewProps) => {
 
       <Grid container spacing={2} alignItems="stretch">
         <Grid item xs={12} md={6} lg={5}>
-          <Paper elevation={0} sx={{ p: 2.5, height: "100%", border: "1px solid #e2e8f0" }}>
+          <Paper elevation={0} sx={{ p: 2.5, height: "100%", border: "1px solid #E3D4C1" }}>
             <TextField
               value={searchTerm}
               onChange={(event) => setSearchTerm(event.target.value)}

@@ -17,8 +17,8 @@ const PlaceholderCard = ({ title, subtitle, height = 220, actionText }: Placehol
         display: "flex",
         flexDirection: "column",
         gap: 1.5,
-        border: "1px dashed #e2e8f0",
-        background: "linear-gradient(180deg, #ffffff 0%, #f8fafc 100%)"
+        border: "1px dashed #E3D4C1",
+        background: "linear-gradient(180deg, #FFF8EE 0%, #F6E6D4 100%)"
       }}
     >
       <Stack direction="row" justifyContent="space-between" alignItems="baseline" spacing={1}>
@@ -40,9 +40,9 @@ const PlaceholderCard = ({ title, subtitle, height = 220, actionText }: Placehol
         sx={{
           flex: 1,
           borderRadius: 2,
-          border: "1px dashed #cbd5e1",
+          border: "1px dashed #D6C4B2",
           background:
-            "repeating-linear-gradient(45deg, #f8fafc, #f8fafc 10px, #f1f5f9 10px, #f1f5f9 20px)"
+            "repeating-linear-gradient(45deg, #F6E6D4, #F6E6D4 10px, #F0DEC7 10px, #F0DEC7 20px)"
         }}
       />
     </Paper>

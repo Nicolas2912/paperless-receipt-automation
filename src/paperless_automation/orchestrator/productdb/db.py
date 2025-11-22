@@ -993,6 +993,36 @@ class ProductDatabase:
 
             return {"filters": filter_meta, "points": timeseries}
 
+    def fetch_monthly_spend(self, *, date_from: Optional[str] = None, date_to: Optional[str] = None) -> Dict[str, Any]:
+        """Return monthly gross totals and receipt counts within an optional date range."""
+        where_sql, params, filter_meta = self._date_filters(date_from, date_to)
+        with self.connect() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"""
+                SELECT
+                    STRFTIME('%Y-%m', r.purchase_date_time) AS month_key,
+                    DATE(STRFTIME('%Y-%m-01', r.purchase_date_time)) AS month_start,
+                    SUM(COALESCE(r.total_gross, 0)) AS total_gross_cents,
+                    COUNT(*) AS receipt_count
+                FROM receipts r
+                {where_sql}
+                GROUP BY month_key, month_start
+                ORDER BY month_start ASC;
+                """,
+                params,
+            )
+            monthly = [
+                {
+                    "month": row["month_key"],
+                    "total_gross_cents": int(row["total_gross_cents"] or 0),
+                    "receipt_count": int(row["receipt_count"] or 0),
+                }
+                for row in cur.fetchall()
+            ]
+
+        return {"filters": filter_meta, "points": monthly}
+
     def fetch_merchant_spend(
         self, *, date_from: Optional[str] = None, date_to: Optional[str] = None, limit: int = 10
     ) -> Dict[str, Any]:
