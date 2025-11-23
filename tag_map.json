@@ -12,6 +12,10 @@
   "bauhaus": "Baumarkt",
   "lidl": "Discounter",
   "kaufland": "Discounter",
-  "penny": "Discounter"
+  "penny": "Discounter",
+  "edeka": "Supermarkt",
+  "marktkauf": "Verbrauchermarkt",
+  "woolworth": "Discount-Kaufhaus",
+  "dominos":  "Imbiss"
 }
 

@@ -145,6 +145,26 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return JSONResponse(payload)
 
+    async def payment_method_split(request: Request) -> JSONResponse:
+        qp = request.query_params
+        date_from = qp.get("from") or qp.get("date_from")
+        date_to = qp.get("to") or qp.get("date_to")
+        try:
+            payload = db.fetch_payment_method_split(date_from=date_from, date_to=date_to)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(payload)
+
+    async def tax_rate_split(request: Request) -> JSONResponse:
+        qp = request.query_params
+        date_from = qp.get("from") or qp.get("date_from")
+        date_to = qp.get("to") or qp.get("date_to")
+        try:
+            payload = db.fetch_tax_rate_split(date_from=date_from, date_to=date_to)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(payload)
+
     async def table_rows(request: Request) -> JSONResponse:
         table = request.path_params["table"]
         qp = request.query_params
@@ -165,6 +185,8 @@ def create_app(
         Route("/api/timeseries/spend", spend_timeseries, methods=["GET"]),
         Route("/api/analytics/merchant_spend", merchant_spend, methods=["GET"]),
         Route("/api/analytics/monthly_spend", monthly_spend, methods=["GET"]),
+        Route("/api/analytics/payment_method_split", payment_method_split, methods=["GET"]),
+        Route("/api/analytics/tax_rate_split", tax_rate_split, methods=["GET"]),
         Route("/api/tables/{table:str}", table_rows, methods=["GET"]),
     ]
 

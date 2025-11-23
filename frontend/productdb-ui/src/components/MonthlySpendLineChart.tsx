@@ -6,28 +6,12 @@ import axios from "axios";
 import { fetchMonthlySpend, fetchSpendTimeseries, MonthlySpendPoint, SpendTimeseriesPoint } from "../api/client";
 import { GlobalFilters } from "./GlobalFilterBar";
 import { formatCurrency } from "../utils/format";
+import { resolveDateRange } from "../utils/dateRange";
 
 interface MonthlySpendLineChartProps {
   filters: GlobalFilters;
   height?: number;
 }
-
-const resolveDateRange = (timeRange: string): { from: string | null; to: string | null } => {
-  const today = dayjs();
-  switch (timeRange) {
-    case "this_month":
-      return { from: today.startOf("month").format("YYYY-MM-DD"), to: today.endOf("month").format("YYYY-MM-DD") };
-    case "this_year":
-      return { from: today.startOf("year").format("YYYY-MM-DD"), to: today.endOf("month").format("YYYY-MM-DD") };
-    case "last_12_months":
-      return {
-        from: today.startOf("month").subtract(11, "month").format("YYYY-MM-DD"),
-        to: today.endOf("month").format("YYYY-MM-DD")
-      };
-    default:
-      return { from: null, to: null };
-  }
-};
 
 type ChartPoint = {
   key: string;
@@ -53,8 +37,8 @@ const buildPaths = (points: ChartPoint[]) => {
   const maxValueRaw = Math.max(...points.map((p) => p.value), 0);
   const maxValue = maxValueRaw <= 0 ? 1 : maxValueRaw * 1.05; // add headroom
   const viewWidth = 280;
-  const viewHeight = 100;
-  const margin = { top: 8, right: 6, bottom: 20, left: 14 };
+  const viewHeight = 104;
+  const margin = { top: 8, right: 6, bottom: 24, left: 14 };
   const usableWidth = viewWidth - margin.left - margin.right;
   const usableHeight = viewHeight - margin.top - margin.bottom;
   const denom = Math.max(points.length - 1, 1);
@@ -204,7 +188,8 @@ const MonthlySpendLineChart = ({ filters, height = 420 }: MonthlySpendLineChartP
     const last = activePoints[activePoints.length - 1]?.date;
     const formattedRange =
       first && last ? `${first.format("MMM YYYY")} – ${last.format("MMM YYYY")}` : "No data";
-    return { grossSum, receiptCount, formattedRange };
+    const averageValue = activePoints.length > 0 ? grossSum / activePoints.length : 0;
+    return { grossSum, receiptCount, formattedRange, averageValue };
   }, [activePoints]);
 
   const { pathD, coords, labels, yTicks, viewBox, margin } = useMemo(
@@ -225,6 +210,7 @@ const MonthlySpendLineChart = ({ filters, height = 420 }: MonthlySpendLineChartP
       minimumFractionDigits: 0,
       maximumFractionDigits: 0
     }).format((value ?? 0) / 100);
+  const averageUnitLabel = interval === "monthly" ? "month" : "day";
 
   return (
     <Paper
@@ -247,11 +233,24 @@ const MonthlySpendLineChart = ({ filters, height = 420 }: MonthlySpendLineChartP
           <Typography variant="body2" color="text.secondary">
             Sum of total_gross per month. Filters apply to the underlying receipts; currency shown as {filters.currency}.
           </Typography>
-          <Stack direction="row" spacing={1} alignItems="center">
-            <Chip size="small" label={timeLabel} />
-            <Typography variant="caption" color="text.secondary">
-              Range: {totals.formattedRange}
-            </Typography>
+          <Stack spacing={0.25}>
+            <Stack direction="row" spacing={1} alignItems="center">
+              <Chip size="small" label={timeLabel} />
+              <Typography variant="caption" color="text.secondary">
+                Range: {totals.formattedRange}
+              </Typography>
+            </Stack>
+            <Stack spacing={0.25}>
+              <Stack direction="row" spacing={1} alignItems="center">
+                <Chip size="small" label="Average" />
+                <Typography variant="subtitle2" fontWeight={700}>
+                  {formatCurrency(totals.averageValue, filters.currency)}
+                </Typography>
+              </Stack>
+              <Typography variant="caption" color="text.secondary">
+                Per {averageUnitLabel}
+              </Typography>
+            </Stack>
           </Stack>
         </Stack>
         <Stack alignItems="flex-end" spacing={0.75}>

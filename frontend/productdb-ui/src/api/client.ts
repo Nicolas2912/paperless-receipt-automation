@@ -195,6 +195,34 @@ export interface MerchantSpendResponse {
   items: MerchantSpendItem[];
 }
 
+export interface PaymentMethodSplitItem {
+  payment_method: string;
+  total_gross_cents: number;
+  receipt_count: number;
+}
+
+export interface PaymentMethodSplitResponse {
+  filters: {
+    date_from: string | null;
+    date_to: string | null;
+  };
+  items: PaymentMethodSplitItem[];
+}
+
+export interface TaxRateSplitItem {
+  tax_rate: number;
+  line_gross_cents: number;
+  item_count: number;
+}
+
+export interface TaxRateSplitResponse {
+  filters: {
+    date_from: string | null;
+    date_to: string | null;
+  };
+  items: TaxRateSplitItem[];
+}
+
 export const fetchSummary = async (filters: SummaryFilters = {}): Promise<SummaryResponse> => {
   const params = new URLSearchParams();
   if (filters.dateFrom) {
@@ -249,6 +277,46 @@ export const fetchMerchantSpend = async (
   params.set("limit", String(limit));
   const { data } = await api.get<MerchantSpendResponse>("/analytics/merchant_spend", { params });
   return data;
+};
+
+export const fetchPaymentMethodSplit = async (
+  filters: SummaryFilters = {}
+): Promise<PaymentMethodSplitResponse> => {
+  const params = new URLSearchParams();
+  if (filters.dateFrom) {
+    params.set("from", filters.dateFrom);
+  }
+  if (filters.dateTo) {
+    params.set("to", filters.dateTo);
+  }
+  try {
+    const { data } = await api.get<PaymentMethodSplitResponse>("/analytics/payment_method_split", { params });
+    return data;
+  } catch (error) {
+    if (axios.isAxiosError(error) && error.response?.status === 404) {
+      return { filters: { date_from: null, date_to: null }, items: [] };
+    }
+    throw error;
+  }
+};
+
+export const fetchTaxRateSplit = async (filters: SummaryFilters = {}): Promise<TaxRateSplitResponse> => {
+  const params = new URLSearchParams();
+  if (filters.dateFrom) {
+    params.set("from", filters.dateFrom);
+  }
+  if (filters.dateTo) {
+    params.set("to", filters.dateTo);
+  }
+  try {
+    const { data } = await api.get<TaxRateSplitResponse>("/analytics/tax_rate_split", { params });
+    return data;
+  } catch (error) {
+    if (axios.isAxiosError(error) && error.response?.status === 404) {
+      return { filters: { date_from: null, date_to: null }, items: [] };
+    }
+    throw error;
+  }
 };
 
 export const fetchReceipts = async (query: ReceiptsQuery = {}): Promise<ReceiptsOverviewResponse> => {

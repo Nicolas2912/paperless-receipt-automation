@@ -41,14 +41,25 @@ class ReceiptExtractionService:
         LOG.info("Validated extraction payload with top-level keys: %s", list(valid.keys()))
         return valid
 
-    def run_and_persist(self, source_path: str, *, model_name: str = "gpt-5-mini", script_dir: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def run_and_persist(
+        self,
+        source_path: str,
+        *,
+        model_name: str = "gpt-5-mini",
+        script_dir: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """End-to-end: extract → validate → insert all rows. Returns summary.
 
         Summary includes ids and counts to aid debugging/testing.
         """
-        payload = self.extract_from_image(source_path, model_name=model_name, script_dir=script_dir)
-        if payload is None:
+        validated_payload = payload
+        if validated_payload is None:
+            validated_payload = self.extract_from_image(source_path, model_name=model_name, script_dir=script_dir)
+        if validated_payload is None:
             return None
+        # Avoid mutating caller-provided payload
+        payload = dict(validated_payload)
 
         # Insert raw JSON payload for traceability
         import json as _json

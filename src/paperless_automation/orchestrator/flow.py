@@ -53,6 +53,7 @@ class FlowConfig:
     index: ProcessedIndex
     script_dir: str
     repo_root: str
+    use_openrouter_primary: bool
 
 
 def build_flow_config(args, *, script_dir: str) -> FlowConfig:
@@ -102,6 +103,7 @@ def build_flow_config(args, *, script_dir: str) -> FlowConfig:
         index=index,
         script_dir=script_dir,
         repo_root=repo_root,
+        use_openrouter_primary=not bool(getattr(args, "use_ollama_primary", False)),
     )
 
 
@@ -113,6 +115,10 @@ class ReceiptFlow:
         LOG.info("ReceiptFlow orchestrator ready")
         LOG.info(f"Index database path: {self.config.index.db_path}")
         self._productdb_service: Optional[ReceiptExtractionService] = None
+        LOG.info(
+            "Primary extraction backend: %s",
+            "OpenRouter" if self.config.use_openrouter_primary else "Ollama",
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -155,6 +161,56 @@ class ReceiptFlow:
             LOG.info("Product DB extraction service initialized")
         return self._productdb_service
 
+    def _wait_for_stable_file(self, path: str, *, attempts: int = 5, sleep_seconds: float = 0.5) -> bool:
+        """Ensure the file exists and is readable before processing.
+
+        Helps avoid transient 'invalid argument' / sharing violations on Windows
+        when the producer is still writing the file.
+        """
+        last_size: Optional[int] = None
+        for i in range(attempts):
+            if not os.path.isfile(path):
+                time.sleep(sleep_seconds)
+                continue
+            try:
+                size = os.path.getsize(path)
+                with open(path, "rb") as handle:
+                    handle.read(1024)  # minimal read to catch invalid argument errors early
+            except OSError as exc:
+                LOG.warning(f"File not ready (attempt {i+1}/{attempts}) for {path}: {exc}")
+                time.sleep(sleep_seconds)
+                continue
+            if last_size is not None and size == last_size:
+                return True
+            last_size = size
+            time.sleep(sleep_seconds)
+        LOG.error(f"File never became stable/readable after {attempts} attempts: {path}")
+        return False
+
+    def _run_openrouter_extraction(self, source_path: str) -> Optional[Dict[str, object]]:
+        """Call the OpenRouter-based extractor once for reuse in overlay + product DB."""
+        try:
+            service = self._get_productdb_service()
+            payload = service.extract_from_image(
+                source_path,
+                script_dir=self.config.script_dir,
+            )
+        except Exception as exc:
+            LOG.warning(f"OpenRouter primary extraction failed; will fall back to Ollama. Reason: {exc}")
+            return None
+
+        if not isinstance(payload, dict):
+            LOG.warning("OpenRouter extraction produced no payload; will fall back to Ollama.")
+            return None
+
+        raw = payload.get("raw_content")
+        if not (isinstance(raw, str) and raw.strip()):
+            LOG.warning("OpenRouter payload missing raw_content; will fall back to Ollama for transcript.")
+            return payload
+
+        LOG.info("OpenRouter primary extraction succeeded; reusing transcript for overlay and metadata.")
+        return payload
+
     def _preserve_original_image(self, path: str) -> Optional[str]:
         if not path:
             return None
@@ -179,6 +235,7 @@ class ReceiptFlow:
         original_path: str,
         active_path: str,
         preserved_path: Optional[str],
+        precomputed_payload: Optional[Dict[str, object]] = None,
     ) -> None:
         def _cleanup(path: Optional[str]) -> None:
             if path and os.path.isfile(path):
@@ -216,6 +273,7 @@ class ReceiptFlow:
             summary = service.run_and_persist(
                 source_path,
                 script_dir=self.config.script_dir,
+                payload=precomputed_payload,
             )
             if summary:
                 LOG.info(f"Product DB persistence summary: {summary}")
@@ -247,17 +305,29 @@ class ReceiptFlow:
         listener: Optional[ScanEventListener] = None,
     ) -> Optional[str]:
         LOG.info(f"=== Processing image: {image_path}")
+        if not self._wait_for_stable_file(image_path):
+            return None
         file_hash, skip = self._preflight_hash(image_path)
         if skip:
             return None
 
         preserved_image_path = self._preserve_original_image(image_path)
 
-        transcript = transcribe_image(
-            image_path,
-            ollama_url=self.config.ollama_url,
-            model=self.config.ollama_model,
-        )
+        openrouter_payload: Optional[Dict[str, object]] = None
+        transcript: Optional[str] = None
+        if self.config.use_openrouter_primary:
+            openrouter_payload = self._run_openrouter_extraction(image_path)
+            if isinstance(openrouter_payload, dict):
+                raw_content = openrouter_payload.get("raw_content")
+                if isinstance(raw_content, str) and raw_content.strip():
+                    transcript = raw_content.strip()
+
+        if not transcript:
+            transcript = transcribe_image(
+                image_path,
+                ollama_url=self.config.ollama_url,
+                model=self.config.ollama_model,
+            )
         if not transcript:
             LOG.error("Transcription returned no text; aborting pipeline for this file")
             return None
@@ -320,6 +390,7 @@ class ReceiptFlow:
             original_path=image_path,
             active_path=new_image_path,
             preserved_path=preserved_image_path,
+            precomputed_payload=openrouter_payload if self.config.use_openrouter_primary else None,
         )
 
         return new_pdf_path
@@ -331,12 +402,23 @@ class ReceiptFlow:
         listener: Optional[ScanEventListener] = None,
     ) -> Optional[str]:
         LOG.info(f"=== Processing PDF: {pdf_path}")
+        if not self._wait_for_stable_file(pdf_path):
+            return None
         file_hash, skip = self._preflight_hash(pdf_path)
         if skip:
             return None
 
+        openrouter_payload: Optional[Dict[str, object]] = None
+        transcript: Optional[str] = None
+        if self.config.use_openrouter_primary:
+            openrouter_payload = self._run_openrouter_extraction(pdf_path)
+            if isinstance(openrouter_payload, dict):
+                raw_content = openrouter_payload.get("raw_content")
+                if isinstance(raw_content, str) and raw_content.strip():
+                    transcript = raw_content.strip()
+
         metadata = extract_metadata(
-            transcript=None,
+            transcript=transcript,
             source_path=pdf_path,
             ollama_url=self.config.ollama_url,
             model=self.config.ollama_model,
@@ -386,6 +468,7 @@ class ReceiptFlow:
             original_path=pdf_path,
             active_path=new_pdf_path,
             preserved_path=None,
+            precomputed_payload=openrouter_payload if self.config.use_openrouter_primary else None,
         )
 
         return new_pdf_path

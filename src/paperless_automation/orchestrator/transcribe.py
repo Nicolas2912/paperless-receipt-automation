@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import time
 from typing import Optional
 
 import requests
@@ -25,12 +26,29 @@ DEFAULT_INSTRUCTION = (
 STREAM_ECHO_DEFAULT: bool = False
 
 
-def _encode_image_b64(path: str) -> str:
+def _read_file_bytes_with_retries(path: str, *, attempts: int = 6, sleep_seconds: float = 0.5) -> Optional[bytes]:
+    """Read file contents with basic retry to avoid transient Windows locking/invalid-argument errors."""
     p = _fix_input(path)
     if not os.path.isabs(p):
         p = os.path.abspath(p)
-    with open(p, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
+    last_exc: Optional[Exception] = None
+    for i in range(attempts):
+        try:
+            with open(p, "rb") as f:
+                return f.read()
+        except OSError as exc:
+            last_exc = exc
+            LOG.warning(f"Read attempt {i+1}/{attempts} failed for {p}: {exc}")
+            time.sleep(sleep_seconds)
+    LOG.error(f"Failed to read file after {attempts} attempts: {p} ({last_exc})")
+    return None
+
+
+def _encode_image_b64(path: str) -> str:
+    data = _read_file_bytes_with_retries(path)
+    if data is None:
+        raise OSError(f"Unable to read file for base64: {path}")
+    return base64.b64encode(data).decode("utf-8")
 
 
 def transcribe_image(
@@ -53,19 +71,19 @@ def transcribe_image(
     LOG.debug(f"Image path: {image_path}")
     LOG.debug(f"Ollama URL: {url}; model: {model}; timeout: {timeout}s")
 
-    img_b64 = _encode_image_b64(image_path)
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": instruction, "images": [img_b64]}],
-        "stream": True,
-        "options": {
-            "num_predict": 2048,
-            "temperature": 0,
-            "stop": ["<eot>"],
-        },
-    }
-
     try:
+        img_b64 = _encode_image_b64(image_path)
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": instruction, "images": [img_b64]}],
+            "stream": True,
+            "options": {
+                "num_predict": 2048,
+                "temperature": 0,
+                "stop": ["<eot>"],
+            },
+        }
+
         # Stream the response and echo tokens to console as they arrive
         if echo:
             LOG.info("Streaming transcription from Ollama (tokens will appear below)...")

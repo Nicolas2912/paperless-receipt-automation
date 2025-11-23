@@ -1023,6 +1023,73 @@ class ProductDatabase:
 
         return {"filters": filter_meta, "points": monthly}
 
+    def fetch_payment_method_split(
+        self, *, date_from: Optional[str] = None, date_to: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Return spend split by payment method within an optional date range."""
+        where_sql, params, filter_meta = self._date_filters(date_from, date_to)
+        with self.connect() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"""
+                SELECT
+                    r.payment_method AS payment_method,
+                    SUM(COALESCE(r.total_gross, 0)) AS total_gross_cents,
+                    COUNT(*) AS receipt_count
+                FROM receipts r
+                {where_sql}
+                GROUP BY r.payment_method
+                ORDER BY total_gross_cents DESC, r.payment_method ASC;
+                """,
+                params,
+            )
+            items = [
+                {
+                    "payment_method": row["payment_method"],
+                    "total_gross_cents": int(row["total_gross_cents"] or 0),
+                    "receipt_count": int(row["receipt_count"] or 0),
+                }
+                for row in cur.fetchall()
+            ]
+
+        return {"filters": filter_meta, "items": items}
+
+    def fetch_tax_rate_split(self, *, date_from: Optional[str] = None, date_to: Optional[str] = None) -> Dict[str, Any]:
+        """Return spend split by tax rate (line items) within an optional date range."""
+        where_sql, params, filter_meta = self._date_filters(date_from, date_to)
+        with self.connect() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"""
+                SELECT
+                    i.tax_rate AS tax_rate,
+                    SUM(
+                        COALESCE(
+                            i.line_gross,
+                            COALESCE(i.line_net, 0) + COALESCE(i.line_tax, 0),
+                            0
+                        )
+                    ) AS line_gross_cents,
+                    COUNT(*) AS item_count
+                FROM receipt_items i
+                JOIN receipts r ON r.receipt_id = i.receipt_id
+                {where_sql}
+                GROUP BY i.tax_rate
+                ORDER BY i.tax_rate ASC;
+                """,
+                params,
+            )
+            items = [
+                {
+                    "tax_rate": float(row["tax_rate"]),
+                    "line_gross_cents": int(row["line_gross_cents"] or 0),
+                    "item_count": int(row["item_count"] or 0),
+                }
+                for row in cur.fetchall()
+            ]
+
+        return {"filters": filter_meta, "items": items}
+
     def fetch_merchant_spend(
         self, *, date_from: Optional[str] = None, date_to: Optional[str] = None, limit: int = 10
     ) -> Dict[str, Any]:

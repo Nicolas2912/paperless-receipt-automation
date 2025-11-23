@@ -6,6 +6,7 @@ from difflib import SequenceMatcher
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import time
 from dotenv import load_dotenv
 
 
@@ -78,14 +79,19 @@ def _b64_data_url(path: str) -> Optional[str]:
     if not mime or (not mime.startswith("image/") and mime != "application/pdf"):
         LOG.error("Unsupported MIME type for extraction: %s", mime)
         return None
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-        b64 = base64.b64encode(data).decode("ascii")
-        return f"data:{mime};base64,{b64}"
-    except Exception as e:
-        LOG.error("Failed to read source file for data URL: %s", e)
-        return None
+    last_exc: Optional[Exception] = None
+    for i in range(6):
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            b64 = base64.b64encode(data).decode("ascii")
+            return f"data:{mime};base64,{b64}"
+        except Exception as e:
+            last_exc = e
+            LOG.warning("Failed to read source file for data URL (attempt %s/6): %s", i + 1, e)
+            time.sleep(0.5)
+    LOG.error("Failed to read source file for data URL after retries: %s", last_exc)
+    return None
 
 def _file_facts(path: str) -> Dict[str, Any]:
     try:

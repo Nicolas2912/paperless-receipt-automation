@@ -6,6 +6,11 @@
  $env:PYTHONPATH="$PWD\src"
  ```
 
+CMD:
+
+```bash
+set PYTHONPATH=%CD%\src
+```
 
 
 # Testing openrouter image extraction (one file)

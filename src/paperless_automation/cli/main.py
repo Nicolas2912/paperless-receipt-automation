@@ -133,6 +133,11 @@ def _add_flow_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--token", help="Paperless API token (overrides env/.env)")
     p.add_argument("--insecure", action="store_true", help="Disable TLS verification for Paperless calls")
     p.add_argument("--timeout", type=int, default=60, help="HTTP timeout in seconds for Paperless requests")
+    p.add_argument(
+        "--use-ollama-primary",
+        action="store_true",
+        help="Use Ollama as the primary transcript source (default primary is OpenRouter).",
+    )
 
 
 def _handle_flow(args: argparse.Namespace) -> int:

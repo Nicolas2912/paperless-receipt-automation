@@ -5,6 +5,8 @@ import { GlobalFilters } from "../components/GlobalFilterBar";
 import { fetchSummary } from "../api/client";
 import { formatCurrency } from "../utils/format";
 import MonthlySpendLineChart from "../components/MonthlySpendLineChart";
+import PaymentMethodDonut from "../components/PaymentMethodDonut";
+import TaxRateSplitChart from "../components/TaxRateSplitChart";
 
 interface DashboardViewProps {
   filters: GlobalFilters;
@@ -61,20 +63,10 @@ const DashboardView = ({ filters }: DashboardViewProps) => {
         <Grid item xs={12} lg={5}>
           <Grid container spacing={2}>
             <Grid item xs={12} md={6} lg={12}>
-              <PlaceholderCard
-                title="PaymentMethodDonut"
-                subtitle="Split: CASH / CARD / OTHER"
-                height={140}
-                actionText="Donut"
-              />
+              <PaymentMethodDonut filters={filters} height={260} />
             </Grid>
             <Grid item xs={12} md={6} lg={12}>
-              <PlaceholderCard
-                title="TaxRateSplit"
-                subtitle="0% / 7% / 19% — donut or stacked bar"
-                height={140}
-                actionText="Donut"
-              />
+              <TaxRateSplitChart filters={filters} height={260} />
             </Grid>
           </Grid>
         </Grid>
