@@ -43,8 +43,12 @@ const navItems: Array<{ key: PageKey; label: string; icon: React.ReactNode; desc
 ];
 
 const UI_COLORS = {
-  background: "#FCEADE",
+  background: "#809848",
+  backgroundGradient: "radial-gradient(circle at 20% 20%, #8aa352 0%, #71883e 40%, #5f7235 100%)",
+  backgroundHighlight: "radial-gradient(600px at 70% 15%, rgba(255,255,255,0.10), rgba(255,255,255,0))",
+  backgroundVignette: "radial-gradient(120% 120% at 50% 50%, rgba(0,0,0,0) 60%, rgba(0,0,0,0.08) 100%)",
   surface: "#FFF8EE",
+  sidebarGradient: "linear-gradient(160deg, #f5ffef 0%, #bee7b8 52%, #a8d5a3 100%)",
   border: "#E3D4C1",
   subtle: "#F6E6D4",
   accentSoft: "#FDC4BE",
@@ -102,7 +106,8 @@ const App = () => {
     <Box
       sx={{
         minHeight: "100vh",
-        backgroundColor: UI_COLORS.background,
+        backgroundImage: `${UI_COLORS.backgroundHighlight}, ${UI_COLORS.backgroundVignette}, ${UI_COLORS.backgroundGradient}`,
+        backgroundRepeat: "no-repeat",
         display: "flex",
         gap: 3,
         p: { xs: 2, md: 3 }
@@ -114,6 +119,7 @@ const App = () => {
           width: { xs: 280, md: 280 },
           flexShrink: 0,
           border: `1px solid ${UI_COLORS.border}`,
+          background: UI_COLORS.sidebarGradient,
           display: "flex",
           flexDirection: "column",
           gap: 2,
@@ -208,7 +214,8 @@ const App = () => {
             display: "flex",
             alignItems: "center",
             justifyContent: "space-between",
-            gap: 2
+            gap: 2,
+            background: "#819D75"
           }}
         >
           <Box>

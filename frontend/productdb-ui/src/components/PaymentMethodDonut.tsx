@@ -67,7 +67,7 @@ const buildSlices = (raw: Array<{ payment_method: string; total_gross_cents: num
   });
 };
 
-const PaymentMethodDonut = ({ filters, height = 260 }: PaymentMethodDonutProps) => {
+const PaymentMethodDonut = ({ filters, height = 220 }: PaymentMethodDonutProps) => {
   const range = resolveDateRange(filters.timeRange);
   const query = useQuery({
     queryKey: ["payment-method-split", range.from, range.to],
@@ -91,19 +91,17 @@ const PaymentMethodDonut = ({ filters, height = 260 }: PaymentMethodDonutProps) 
       sx={{
         p: 2,
         height,
+        width: "100%",
         border: "1px solid #E3D4C1",
         display: "flex",
         flexDirection: "column",
         gap: 1.1
       }}
     >
-      <Stack direction="row" justifyContent="space-between" spacing={2}>
+      <Stack direction="row" justifyContent="flex-start" spacing={2}>
         <Stack spacing={0.25}>
           <Typography variant="subtitle1" fontWeight={800}>
             Payment method split
-          </Typography>
-          <Typography variant="body2" color="text.secondary">
-            Share of total gross grouped by payment method. Filters mirror the monthly spend chart.
           </Typography>
           <Stack direction="row" spacing={1} alignItems="center">
             <Chip size="small" label={filters.timeRange === "custom" ? "Custom" : "Filtered"} />
@@ -111,14 +109,6 @@ const PaymentMethodDonut = ({ filters, height = 260 }: PaymentMethodDonutProps) 
               {totalReceipts} receipts
             </Typography>
           </Stack>
-        </Stack>
-        <Stack spacing={0.15} alignItems="flex-end">
-          <Typography variant="caption" color="text.secondary">
-            Total gross
-          </Typography>
-          <Typography variant="subtitle1" fontWeight={800}>
-            {formatCurrency(totalGross, filters.currency)}
-          </Typography>
         </Stack>
       </Stack>
 

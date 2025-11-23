@@ -69,7 +69,7 @@ const buildSlices = (
   });
 };
 
-const TaxRateSplitChart = ({ filters, height = 260 }: TaxRateSplitChartProps) => {
+const TaxRateSplitChart = ({ filters, height = 220 }: TaxRateSplitChartProps) => {
   const range = resolveDateRange(filters.timeRange);
   const query = useQuery({
     queryKey: ["tax-rate-split", range.from, range.to],
@@ -93,19 +93,17 @@ const TaxRateSplitChart = ({ filters, height = 260 }: TaxRateSplitChartProps) =>
       sx={{
         p: 2,
         height,
+        width: "100%",
         border: "1px solid #E3D4C1",
         display: "flex",
         flexDirection: "column",
         gap: 1.1
       }}
     >
-      <Stack direction="row" justifyContent="space-between" spacing={2}>
+      <Stack direction="row" justifyContent="flex-start" spacing={2}>
         <Stack spacing={0.25}>
           <Typography variant="subtitle1" fontWeight={800}>
             Tax rate split
-          </Typography>
-          <Typography variant="body2" color="text.secondary">
-            Line item gross totals by VAT bracket. Uses the same date window as other charts.
           </Typography>
           <Stack direction="row" spacing={1} alignItems="center">
             <Chip size="small" label={filters.timeRange === "custom" ? "Custom" : "Filtered"} />
@@ -113,14 +111,6 @@ const TaxRateSplitChart = ({ filters, height = 260 }: TaxRateSplitChartProps) =>
               {totalItems} items
             </Typography>
           </Stack>
-        </Stack>
-        <Stack spacing={0.15} alignItems="flex-end">
-          <Typography variant="caption" color="text.secondary">
-            Item gross (total)
-          </Typography>
-          <Typography variant="subtitle1" fontWeight={800}>
-            {formatCurrency(totalGross, filters.currency)}
-          </Typography>
         </Stack>
       </Stack>
 

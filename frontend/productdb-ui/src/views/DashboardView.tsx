@@ -7,6 +7,8 @@ import { formatCurrency } from "../utils/format";
 import MonthlySpendLineChart from "../components/MonthlySpendLineChart";
 import PaymentMethodDonut from "../components/PaymentMethodDonut";
 import TaxRateSplitChart from "../components/TaxRateSplitChart";
+import TopMerchantsBarChart from "../components/TopMerchantsBarChart";
+import CalendarDailySpendHeatmap from "../components/CalendarDailySpendHeatmap";
 
 interface DashboardViewProps {
   filters: GlobalFilters;
@@ -77,18 +79,10 @@ const DashboardView = ({ filters }: DashboardViewProps) => {
 
       <Grid container spacing={2}>
         <Grid item xs={12} md={6}>
-          <PlaceholderCard
-            title="TopMerchantsBarChart"
-            subtitle="Top 10 merchants by spend."
-            height={220}
-          />
+          <TopMerchantsBarChart filters={filters} height={220} />
         </Grid>
         <Grid item xs={12} md={6}>
-          <PlaceholderCard
-            title="CalendarDailySpendHeatmap"
-            subtitle="Intensity = total_gross per day."
-            height={220}
-          />
+          <CalendarDailySpendHeatmap filters={filters} height={220} />
         </Grid>
       </Grid>
     </Stack>

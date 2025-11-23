@@ -28,7 +28,15 @@ const GlobalFilterBar = ({ filters, onChange, merchants, merchantsLoading }: Glo
   const merchantValue = merchants.find((m) => m.merchant_id === filters.merchantId) ?? null;
 
   return (
-    <Paper elevation={0} sx={{ p: 2.5, mb: 2, border: "1px solid #E3D4C1" }}>
+    <Paper
+      elevation={0}
+      sx={{
+        p: 2.5,
+        mb: 2,
+        border: "1px solid #E3D4C1",
+        background: "#eef3cb"
+      }}
+    >
       <Stack direction={{ xs: "column", lg: "row" }} spacing={2}>
         <TextField
           select

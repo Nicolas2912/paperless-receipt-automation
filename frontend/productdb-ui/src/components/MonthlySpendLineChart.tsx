@@ -29,14 +29,14 @@ const buildPaths = (points: ChartPoint[]) => {
       coords: [],
       labels: [] as Array<{ x: number; label: string }>,
       yTicks: [] as Array<{ y: number; value: number }>,
-      viewBox: { width: 360, height: 140 },
+      viewBox: { width: 480, height: 140 },
       margin: { top: 4, right: 14, bottom: 22, left: 12 }
     };
   }
 
   const maxValueRaw = Math.max(...points.map((p) => p.value), 0);
   const maxValue = maxValueRaw <= 0 ? 1 : maxValueRaw * 1.05; // add headroom
-  const viewWidth = 360;
+  const viewWidth = 480;
   const viewHeight = 148;
   const margin = { top: 4, right: 14, bottom: 22, left: 12 };
   const usableWidth = viewWidth - margin.left - margin.right;
@@ -340,7 +340,7 @@ const MonthlySpendLineChart = ({ filters, height = 420 }: MonthlySpendLineChartP
                   strokeDasharray={idx === yTicks.length - 1 ? "4 2" : "2.4 2.4"}
                   vectorEffect="non-scaling-stroke"
                 />
-                <text x={4} y={tick.y + 3} fontSize={6} fill="#4a4036" fontWeight={700}>
+                <text x={4} y={tick.y + 3} fontSize={6.6} fill="#4a4036" fontWeight={700}>
                   {formatTickValue(tick.value)}
                 </text>
               </g>
@@ -384,7 +384,7 @@ const MonthlySpendLineChart = ({ filters, height = 420 }: MonthlySpendLineChartP
                   key={label.label + label.x}
                   x={label.x}
                   y={viewBox.height - margin.bottom + 6}
-                  fontSize={6.6}
+                  fontSize={7.3}
                   fill="#4a4036"
                   fontWeight={700}
                   textAnchor="middle"
