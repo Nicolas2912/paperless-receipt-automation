@@ -1,4 +1,4 @@
-import { Grid, Paper, Stack, Typography } from "@mui/material";
+import { Box, Grid, Paper, Stack, Typography, useMediaQuery, useTheme } from "@mui/material";
 import { useQuery } from "@tanstack/react-query";
 import PlaceholderCard from "../components/PlaceholderCard";
 import { GlobalFilters } from "../components/GlobalFilterBar";
@@ -19,10 +19,13 @@ const DashboardView = ({ filters }: DashboardViewProps) => {
   });
 
   const summary = summaryQuery.data;
+  const theme = useTheme();
+  const isLgUp = useMediaQuery(theme.breakpoints.up("lg"));
+  const monthlyHeight = isLgUp ? 456 : 480;
 
   return (
     <Stack spacing={2}>
-      <Paper elevation={0} sx={{ p: 2.5, border: "1px solid #E3D4C1" }}>
+      <Paper elevation={0} sx={{ p: 2.5, border: "1px solid #E3D4C1", background: "#eef3cb" }}>
         <Stack direction={{ xs: "column", md: "row" }} justifyContent="space-between" spacing={2}>
           <Stack spacing={0.5}>
             <Typography variant="h6" fontWeight={800}>
@@ -56,20 +59,23 @@ const DashboardView = ({ filters }: DashboardViewProps) => {
         </Stack>
       </Paper>
 
-      <Grid container spacing={2}>
-        <Grid item xs={12} lg={7}>
-          <MonthlySpendLineChart filters={filters} />
-        </Grid>
-        <Grid item xs={12} lg={5}>
+      <Stack direction={{ xs: "column", lg: "row" }} spacing={2} alignItems="stretch">
+        <Box sx={{ flex: 1, minWidth: 0 }}>
+          <MonthlySpendLineChart filters={filters} height={monthlyHeight} />
+        </Box>
+        <Box sx={{ width: { xs: "100%", lg: 420 }, maxWidth: { xs: "100%", lg: 420 }, flexShrink: 0, ml: { lg: "auto" } }}>
           <Grid container spacing={2}>
-            <Grid item xs={12} md={6} lg={12}>
-              <PaymentMethodDonut filters={filters} height={260} />
+            <Grid item xs={12}>
+              <PaymentMethodDonut filters={filters} height={220} />
             </Grid>
-            <Grid item xs={12} md={6} lg={12}>
-              <TaxRateSplitChart filters={filters} height={260} />
+            <Grid item xs={12}>
+              <TaxRateSplitChart filters={filters} height={220} />
             </Grid>
           </Grid>
-        </Grid>
+        </Box>
+      </Stack>
+
+      <Grid container spacing={2}>
         <Grid item xs={12} md={6}>
           <PlaceholderCard
             title="TopMerchantsBarChart"

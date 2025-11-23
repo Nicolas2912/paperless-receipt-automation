@@ -29,16 +29,16 @@ const buildPaths = (points: ChartPoint[]) => {
       coords: [],
       labels: [] as Array<{ x: number; label: string }>,
       yTicks: [] as Array<{ y: number; value: number }>,
-      viewBox: { width: 280, height: 100 },
-      margin: { top: 8, right: 6, bottom: 20, left: 14 }
+      viewBox: { width: 360, height: 140 },
+      margin: { top: 4, right: 14, bottom: 22, left: 12 }
     };
   }
 
   const maxValueRaw = Math.max(...points.map((p) => p.value), 0);
   const maxValue = maxValueRaw <= 0 ? 1 : maxValueRaw * 1.05; // add headroom
-  const viewWidth = 280;
-  const viewHeight = 104;
-  const margin = { top: 8, right: 6, bottom: 24, left: 14 };
+  const viewWidth = 360;
+  const viewHeight = 148;
+  const margin = { top: 4, right: 14, bottom: 22, left: 12 };
   const usableWidth = viewWidth - margin.left - margin.right;
   const usableHeight = viewHeight - margin.top - margin.bottom;
   const denom = Math.max(points.length - 1, 1);
@@ -148,7 +148,7 @@ const MonthlySpendLineChart = ({ filters, height = 420 }: MonthlySpendLineChartP
     }
   }, [filters.timeRange]);
 
-  const chartHeight = Math.max(height - 170, 260);
+  const chartHeight = Math.max(height - 170, 280);
 
   const monthlyPoints = useMemo<ChartPoint[]>(() => {
     const pts = monthlySpendQuery.data?.points ?? [];
@@ -211,12 +211,26 @@ const MonthlySpendLineChart = ({ filters, height = 420 }: MonthlySpendLineChartP
       maximumFractionDigits: 0
     }).format((value ?? 0) / 100);
   const averageUnitLabel = interval === "monthly" ? "month" : "day";
+  const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
+
+  const tooltipMeta =
+    hoverIndex !== null && activePoints[hoverIndex] && coords[hoverIndex]
+      ? (() => {
+          const rawLeft = (coords[hoverIndex].x / viewBox.width) * 100;
+          const rawTop = (coords[hoverIndex].y / viewBox.height) * 100;
+          const left = clamp(rawLeft, 6, 94);
+          const top = clamp(rawTop, 10, 90);
+          const translateY = top < 18 ? "12%" : top > 78 ? "-80%" : "-110%";
+          return { left, top, translateY };
+        })()
+      : null;
 
   return (
     <Paper
       elevation={0}
       sx={{
         p: 2.5,
+        pr: 2.5,
         height,
         border: "1px solid #E3D4C1",
         position: "relative",
@@ -277,7 +291,7 @@ const MonthlySpendLineChart = ({ filters, height = 420 }: MonthlySpendLineChartP
           </Stack>
         </Stack>
 
-      <Box sx={{ mt: 3, position: "relative", flex: 1, minHeight: chartHeight, overflow: "hidden" }}>
+      <Box sx={{ mt: 1, position: "relative", flex: 1, minHeight: chartHeight, overflow: "hidden" }}>
         {isLoading ? (
           <Stack height="100%" alignItems="center" justifyContent="center">
             <CircularProgress size={28} />
@@ -323,14 +337,14 @@ const MonthlySpendLineChart = ({ filters, height = 420 }: MonthlySpendLineChartP
                     y2={tick.y}
                     stroke="#E3D4C1"
                     strokeWidth={idx === yTicks.length - 1 ? 1.35 : 0.95}
-                    strokeDasharray={idx === yTicks.length - 1 ? "4 2" : "2.4 2.4"}
-                    vectorEffect="non-scaling-stroke"
-                  />
-                  <text x={4} y={tick.y + 2.6} fontSize={4.2} fill="#6b5b4d">
-                    {formatTickValue(tick.value)}
-                  </text>
-                </g>
-              ))}
+                  strokeDasharray={idx === yTicks.length - 1 ? "4 2" : "2.4 2.4"}
+                  vectorEffect="non-scaling-stroke"
+                />
+                <text x={4} y={tick.y + 3} fontSize={6} fill="#4a4036" fontWeight={700}>
+                  {formatTickValue(tick.value)}
+                </text>
+              </g>
+            ))}
               {/* X axis */}
               <line
                 x1={margin.left}
@@ -370,9 +384,11 @@ const MonthlySpendLineChart = ({ filters, height = 420 }: MonthlySpendLineChartP
                   key={label.label + label.x}
                   x={label.x}
                   y={viewBox.height - margin.bottom + 6}
-                  fontSize={4.6}
-                  fill="#6b5b4d"
+                  fontSize={6.6}
+                  fill="#4a4036"
+                  fontWeight={700}
                   textAnchor="middle"
+                  alignmentBaseline="hanging"
                 >
                   {label.label}
                 </text>
@@ -393,7 +409,7 @@ const MonthlySpendLineChart = ({ filters, height = 420 }: MonthlySpendLineChartP
                 d={pathD}
                 fill="none"
                 stroke="#BC6C25"
-                strokeWidth={1.9}
+                strokeWidth={2.4}
                 strokeLinejoin="round"
                 vectorEffect="non-scaling-stroke"
               />
@@ -404,7 +420,7 @@ const MonthlySpendLineChart = ({ filters, height = 420 }: MonthlySpendLineChartP
                     key={activePoints[index].key}
                     cx={coord.x}
                     cy={coord.y}
-                    r={isHovered ? 3 : activePoints.length <= 2 ? 1.8 : 1.6}
+                    r={isHovered ? 3.6 : activePoints.length <= 2 ? 2.4 : 2.2}
                     fill={isHovered ? "#8C4A14" : index === coords.length - 1 ? "#BC6C25" : "#D6C4B2"}
                     stroke="#FFF8EE"
                     strokeWidth={0.9}
@@ -415,18 +431,20 @@ const MonthlySpendLineChart = ({ filters, height = 420 }: MonthlySpendLineChartP
                 );
               })}
             </svg>
-            {hoverIndex !== null && activePoints[hoverIndex] && coords[hoverIndex] && (
+            {tooltipMeta && hoverIndex !== null && (
               <Paper
                 elevation={0}
                 sx={{
                   position: "absolute",
-                  left: `${(coords[hoverIndex].x / viewBox.width) * 100}%`,
-                  top: `${(coords[hoverIndex].y / viewBox.height) * 100}%`,
-                  transform: "translate(-10%, -110%)",
+                  left: `${tooltipMeta.left}%`,
+                  top: `${tooltipMeta.top}%`,
+                  transform: `translate(-50%, ${tooltipMeta.translateY})`,
                   p: 0.9,
                   border: "1px solid #E3D4C1",
                   backgroundColor: "rgba(255, 248, 238, 0.95)",
-                  boxShadow: "0 8px 24px rgba(0,0,0,0.08)"
+                  boxShadow: "0 8px 24px rgba(0,0,0,0.08)",
+                  pointerEvents: "none",
+                  maxWidth: "60%"
                 }}
               >
                 <Typography variant="caption" color="text.secondary">
